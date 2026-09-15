@@ -1619,15 +1619,20 @@ parse_suppressed_comments() {
       trimmed = trim(line)
       low = tolower(trimmed)
     }
-    incode == 0 && insec == 0 && is_supp_head(low) {
+    # Track fences before the section too. A "## Suppressed comments"
+    # example inside an earlier fenced block is not a real section.
+    trimmed ~ /^```/ {
+      incode = 1 - incode
+      next
+    }
+    incode { next }
+    insec == 0 && is_supp_head(low) {
       insec = 1
       saw_heading = 1
       declared = extract_count(low)
       next
     }
     insec {
-      if (trimmed ~ /^```/) { incode = 1 - incode; next }
-      if (incode) next
       if (trimmed ~ /^#{1,6}[ \t]/ || trimmed ~ /^<\/details>/ ||
           trimmed ~ /^<details/ || low ~ /^<summary>/ ||
           trimmed ~ /^- \*\*/) {
@@ -3468,11 +3473,17 @@ EOF
       rm -f "$OUT_FILE"
       return 1
     fi
-    SUPP_IDS=$(printf '%s\n' "$SUPP_PARSE" | awk -F'\t' 'NR>1 && $1 != "" { print $1 }' | sort -u)
+    # drain_epic invokes this as `run_one_bead || ...`, which disables
+    # errexit. A failed awk/sort/paste must not look like "no suppressed".
+    if ! SUPP_IDS=$(printf '%s\n' "$SUPP_PARSE" | awk -F'\t' 'NR>1 && $1 != "" { print $1 }' | sort -u | paste -sd, -); then
+      print_summary "$BEAD_ID" "$PR_URL" "failed to parse Copilot suppressed comments" "$ROUNDS_USED" "$MERGE_STATUS"
+      log "error: failed to extract Copilot suppressed comment ids on PR #${PR_NUMBER}"
+      rm -f "$OUT_FILE"
+      return 1
+    fi
     if [[ -z "$SUPP_IDS" ]]; then
       SUPP_COUNT=0
     else
-      SUPP_IDS=$(printf '%s\n' "$SUPP_IDS" | paste -sd, -)
       if ! SUPP_COUNT=$(printf '%s\n' "$SUPP_IDS" | awk -F, '{print NF}'); then
         print_summary "$BEAD_ID" "$PR_URL" "failed to parse Copilot suppressed comments" "$ROUNDS_USED" "$MERGE_STATUS"
         log "error: failed to count Copilot suppressed comments on PR #${PR_NUMBER}"
@@ -3504,7 +3515,7 @@ EOF
       fi
       break
     fi
-    if [[ "$COUNT" -eq 0 && "$SUPP_COUNT" -gt 0 && "$FIRST_REVIEW" -eq 0 && "$SUPP_IDS" == "$PREV_SUPP_IDS" ]]; then
+    if [[ "$SUPP_COUNT" -gt 0 && "$FIRST_REVIEW" -eq 0 && "$SUPP_IDS" == "$PREV_SUPP_IDS" ]]; then
       COPILOT_STATUS="still blocking (same suppressed comments)"
       log "suppressed Copilot comments unchanged after a fix round:"
       printf '%s\n' "$SUPP_IDS" | tr ',' '\n' | sed 's/^/- /'
