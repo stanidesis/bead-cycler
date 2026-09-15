@@ -4,7 +4,7 @@ Drop-in host autopilot for a [Beads](https://github.com/gastownhall/beads) repo 
 
 The script claims (or resumes) one implementable bead, asks [Grok](https://grok.x.ai/) to implement it and open a PR, then **bash** polls the configured reviewer (`BEAD_CYCLE_REVIEWER`, default Copilot). It starts another Grok session when there are unresolved reviewer threads, or when a "Needs a Closer Look" (or similar) overview lists suppressed comments with no threads. An overview with neither is treated as green. An APPROVED review (or unchanged unresolved threads) is not green while suppressed comments remain. The same suppressed path:line set after a Grok fix is still blocking; a suppressed-comments section that cannot be parsed is a hard failure. After the reviewer is green it waits for CI, merges if allowed, and closes the bead.
 
-Copy `scripts/bead-cycle` into another Beads repo and run it. No other files are required. Optional `.beads/cycle.conf` (or `beads/cycle.conf`) turns on extra `--drain` close-out gates.
+Copy `scripts/bead-cycle` into another Beads repo and run it. No other files are required. Optional `.beads/cycle.conf` (or `beads/cycle.conf`) turns on extra `--drain` close-out gates. If this repo is a sibling of the target, `scripts/init` can copy the script and write that config after a short wizard.
 
 ## Requirements
 
@@ -20,6 +20,27 @@ Copy `scripts/bead-cycle` into another Beads repo and run it. No other files are
 Bash 3.2+ (stock macOS `/usr/bin/env bash` is fine).
 
 ## Install
+
+### Sibling checkout (`scripts/init`)
+
+From the parent of both repos (or any cwd; `--dir` is the target):
+
+```bash
+./bead-cycler/scripts/init --dir ./my-cool-app/
+```
+
+The wizard resolves the target git toplevel, then:
+
+1. Uses `.beads/` if present (or `beads/` for that layout). If neither exists, asks whether to create `.beads/`, run `bd init`, or abort.
+2. Prompts for core `BEAD_CYCLE_*` keys (Enter = documented default; already-set env vars pre-fill). Then optionally extra `--drain` gates.
+3. Writes `cycle.conf` into that Beads dir.
+4. Copies `scripts/bead-cycle` into `scripts/` when that directory exists; otherwise asks where to put it.
+
+`--yes` is non-interactive (defaults, keep existing files). `--force` overwrites. `--create-beads` or `--bd-init` is required with `--yes` when the target has no Beads dir. `--script-dir` sets the copy destination. `--dry-run` prints actions and writes nothing. `--help` lists every flag.
+
+`init` refuses to install into this bead-cycler repo unless you pass `--force`. It does not copy itself into the target.
+
+### Script only
 
 ```bash
 mkdir -p scripts
