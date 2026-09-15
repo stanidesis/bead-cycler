@@ -1,0 +1,836 @@
+#!/usr/bin/env bash
+# Bootstrap bead-cycle + cycle.conf into a target git repo.
+# Compatible with Bash 3.2 (stock macOS /usr/bin/env bash).
+set -euo pipefail
+
+YES=0
+FORCE=0
+DRY_RUN=0
+CREATE_BEADS=0
+BD_INIT=0
+OPT_DIR=""
+OPT_SCRIPT_DIR=""
+
+INIT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+CYCLER_ROOT=$(cd "$INIT_DIR/.." && pwd)
+SOURCE_CYCLE="$INIT_DIR/bead-cycle"
+
+ROOT=""
+BEADS_ACTION="" # existing | mkdir | bd-init
+BEADS_DIR=""
+CONF_PATH=""
+SCRIPT_DEST=""
+WRITE_CONF=1
+WRITE_SCRIPT=1
+
+# Collected config (empty drain values are omitted from the file).
+CONF_REVIEWER=""
+CONF_BRANCH_PREFIX=""
+CONF_MERGE_METHODS=""
+CONF_MAX_ROUNDS=""
+CONF_MAX_TURNS=""
+CONF_POLL_SECONDS=""
+CONF_REVIEW_TIMEOUT=""
+CONF_CI_TIMEOUT=""
+CONF_MAX_BEADS=""
+CONF_DRAIN_ID_MAP=""
+CONF_DRAIN_ID_MAP_EPIC_KEY=""
+CONF_DRAIN_ID_MAP_CLOSE_KEY=""
+CONF_DRAIN_WRITEUP_GLOB=""
+CONF_DRAIN_WRITEUP_HEADINGS=""
+CONF_DRAIN_WRITEUP_N_MIN=""
+CONF_DRAIN_WRITEUP_N_MAX=""
+CONF_DRAIN_CHANGESET_GLOB=""
+WANT_DRAIN=0
+
+usage() {
+  cat <<'EOF'
+Usage: init [--dir PATH] [options]
+
+Install bead-cycle and write cycle.conf into a target git repo.
+
+Typical (sibling checkout):
+
+  ./bead-cycler/scripts/init --dir ./my-cool-app/
+
+The wizard writes .beads/cycle.conf (or beads/cycle.conf if that layout
+already exists), then copies bead-cycle into scripts/ when that directory
+exists, otherwise asks where to put it (non-interactive --yes creates
+scripts/). Does not copy this init script.
+
+  --dir PATH         Target path (file or dir). Resolved to that repo's
+                     git toplevel. If omitted and stdin is a TTY, prompt
+                     (default: cwd). If omitted with --yes, use cwd.
+  --yes              Non-interactive. Defaults for config prompts.
+                     Keep existing cycle.conf / bead-cycle (do not overwrite).
+  --force            Overwrite existing cycle.conf and bead-cycle without asking.
+  --create-beads     If no .beads/ or beads/, mkdir .beads/ (no bd init).
+  --bd-init          If no .beads/ or beads/, run bd init --non-interactive
+                     in the target.
+  --script-dir PATH  Install bead-cycle here (relative to repo root, or
+                     absolute). A directory gets /bead-cycle appended.
+  --dry-run          Resolve and print actions; write nothing (do not run
+                     bd init).
+  -h, --help         Show this help
+
+--create-beads and --bd-init are mutually exclusive and are ignored when
+a Beads directory already exists. --force wins over --yes for existing
+files. Refuses to init the bead-cycler source tree unless --force.
+
+Core cycle.conf keys (Enter keeps the default; BEAD_CYCLE_* env pre-fills):
+  BEAD_CYCLE_REVIEWER, BEAD_CYCLE_BRANCH_PREFIX, BEAD_CYCLE_MERGE_METHODS,
+  BEAD_CYCLE_MAX_ROUNDS, BEAD_CYCLE_MAX_TURNS, BEAD_CYCLE_POLL_SECONDS,
+  BEAD_CYCLE_REVIEW_TIMEOUT, BEAD_CYCLE_CI_TIMEOUT, BEAD_CYCLE_MAX_BEADS
+
+Then optionally extra --drain gates (omitted by default / with --yes unless
+the matching env var is already set).
+EOF
+}
+
+die() {
+  printf 'error: %s\n' "$*" >&2
+  exit 1
+}
+
+log() {
+  printf '%s\n' "$*" >&2
+}
+
+warn() {
+  printf 'warning: %s\n' "$*" >&2
+}
+
+is_tty() {
+  [[ -t 0 ]]
+}
+
+is_var_set() {
+  eval "[[ -n \"\${$1+x}\" ]]"
+}
+
+var_value() {
+  eval "printf '%s' \"\${$1-}\""
+}
+
+decimal_int() {
+  local n=$1
+  [[ "$n" =~ ^[0-9]+$ ]] || return 1
+  printf '%d' "$((10#$n))"
+}
+
+trim_ws() {
+  local s=$1
+  s=${s#"${s%%[![:space:]]*}"}
+  s=${s%"${s##*[![:space:]]}"}
+  printf '%s' "$s"
+}
+
+need_cmd() {
+  command -v "$1" >/dev/null 2>&1 || die "missing required command: $1"
+}
+
+# Env value of $1 if that variable is set (including empty); else $2.
+effective_default() {
+  local key=$1
+  local fallback=$2
+  if is_var_set "$key"; then
+    var_value "$key"
+  else
+    printf '%s' "$fallback"
+  fi
+}
+
+prompt_line() {
+  local msg=$1
+  local default=$2
+  local ans
+  if [[ "$YES" -eq 1 ]]; then
+    printf '%s\n' "$default"
+    return 0
+  fi
+  if ! is_tty; then
+    die "need a TTY to prompt for ${msg} (pass --yes, or set it on the CLI)"
+  fi
+  if [[ -n "$default" ]]; then
+    printf '%s [%s]: ' "$msg" "$default" >&2
+  else
+    printf '%s: ' "$msg" >&2
+  fi
+  IFS= read -r ans || true
+  ans=${ans%$'\r'}
+  ans=$(trim_ws "$ans")
+  if [[ -z "$ans" ]]; then
+    printf '%s\n' "$default"
+  else
+    printf '%s\n' "$ans"
+  fi
+}
+
+prompt_yn() {
+  local msg=$1
+  local default=$2
+  local hint ans
+  if [[ "$default" == y ]]; then
+    hint='Y/n'
+  else
+    hint='y/N'
+  fi
+  if [[ "$YES" -eq 1 ]]; then
+    if [[ "$default" == y ]]; then
+      return 0
+    fi
+    return 1
+  fi
+  if ! is_tty; then
+    die "need a TTY to prompt: ${msg} (pass --yes or --force)"
+  fi
+  printf '%s [%s]: ' "$msg" "$hint" >&2
+  IFS= read -r ans || true
+  ans=${ans%$'\r'}
+  ans=$(trim_ws "$ans")
+  if [[ -z "$ans" ]]; then
+    ans=$default
+  fi
+  case "$ans" in
+    y|Y|yes|YES) return 0 ;;
+    n|N|no|NO) return 1 ;;
+    *) die "please answer y or n" ;;
+  esac
+}
+
+realpath_dir() {
+  (cd "$1" && pwd -P)
+}
+
+# Quote a cycle.conf value when it would break KEY=VALUE parsing.
+conf_quote() {
+  local val=$1
+  case "$val" in
+    *[[:space:]]*|*'#'*|*"'"*)
+      if [[ "$val" == *"\""* ]]; then
+        die "cycle.conf value cannot contain both quotes and special characters"
+      fi
+      printf '"%s"' "$val"
+      ;;
+    *)
+      printf '%s' "$val"
+      ;;
+  esac
+}
+
+normalize_merge_methods() {
+  local s=$1
+  local item out=""
+  s=$(trim_ws "$s")
+  [[ -n "$s" ]] || return 1
+  while [[ -n "$s" ]]; do
+    if [[ "$s" == *","* ]]; then
+      item=${s%%,*}
+      s=${s#*,}
+    else
+      item=$s
+      s=""
+    fi
+    item=$(trim_ws "$item")
+    case "$item" in
+      squash|merge|rebase) ;;
+      *) return 1 ;;
+    esac
+    if [[ -n "$out" ]]; then
+      out="${out},${item}"
+    else
+      out=$item
+    fi
+  done
+  printf '%s' "$out"
+}
+
+prompt_core_key() {
+  local key=$1
+  local fallback=$2
+  local hint=$3
+  local def
+  def=$(effective_default "$key" "$fallback")
+  if [[ "$YES" -eq 1 ]]; then
+    printf '%s\n' "$def"
+    return 0
+  fi
+  log "$hint"
+  prompt_line "$key" "$def"
+}
+
+prompt_drain_key() {
+  local key=$1
+  local fallback=$2
+  local hint=$3
+  local def
+  def=$(effective_default "$key" "$fallback")
+  if [[ "$YES" -eq 1 ]]; then
+    printf '%s\n' "$def"
+    return 0
+  fi
+  log "$hint"
+  prompt_line "$key" "$def"
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    --dir)
+      [[ -n "${2:-}" ]] || die "--dir requires a path"
+      OPT_DIR=$2
+      shift 2
+      ;;
+    --script-dir)
+      [[ -n "${2:-}" ]] || die "--script-dir requires a path"
+      OPT_SCRIPT_DIR=$2
+      shift 2
+      ;;
+    --yes)
+      YES=1
+      shift
+      ;;
+    --force)
+      FORCE=1
+      shift
+      ;;
+    --create-beads)
+      CREATE_BEADS=1
+      shift
+      ;;
+    --bd-init)
+      BD_INIT=1
+      shift
+      ;;
+    --dry-run)
+      DRY_RUN=1
+      shift
+      ;;
+    --)
+      shift
+      break
+      ;;
+    -*)
+      die "unknown option: $1"
+      ;;
+    *)
+      die "unexpected extra argument: $1"
+      ;;
+  esac
+done
+
+[[ $# -eq 0 ]] || die "unexpected extra argument: $1"
+
+if [[ "$CREATE_BEADS" -eq 1 && "$BD_INIT" -eq 1 ]]; then
+  die "--create-beads and --bd-init are mutually exclusive"
+fi
+
+[[ -f "$SOURCE_CYCLE" ]] || die "missing source script: ${SOURCE_CYCLE}"
+
+need_cmd git
+
+resolve_opt_dir() {
+  local dir=$1
+  if [[ -z "$dir" ]]; then
+    if [[ "$YES" -eq 1 ]]; then
+      dir=$(pwd)
+    elif is_tty; then
+      dir=$(prompt_line "Target git repo" "$(pwd)")
+    else
+      die "pass --dir PATH (or --yes to use the current directory)"
+    fi
+  fi
+  if [[ -f "$dir" ]]; then
+    dir=$(dirname "$dir")
+  fi
+  [[ -d "$dir" ]] || die "not a directory: $dir"
+  dir=$(cd "$dir" && pwd)
+  local top
+  if ! top=$(git -C "$dir" rev-parse --show-toplevel 2>/dev/null); then
+    die "not a git repository: $dir"
+  fi
+  realpath_dir "$top"
+}
+
+ROOT=$(resolve_opt_dir "$OPT_DIR")
+
+CYCLER_REAL=$(realpath_dir "$CYCLER_ROOT")
+if [[ "$ROOT" == "$CYCLER_REAL" && "$FORCE" -eq 0 ]]; then
+  die "refusing to init the bead-cycler source tree (pass --force to override)"
+fi
+
+# Tell the user when --dir was not the git toplevel.
+if [[ -n "$OPT_DIR" ]]; then
+  if [[ -d "$OPT_DIR" ]]; then
+    opt_abs=$(cd "$OPT_DIR" && pwd -P)
+    if [[ "$opt_abs" != "$ROOT" ]]; then
+      log "resolved git toplevel: $ROOT"
+    fi
+  elif [[ -f "$OPT_DIR" ]]; then
+    log "resolved git toplevel: $ROOT"
+  fi
+else
+  log "target repo: $ROOT"
+fi
+
+choose_beads_dir() {
+  if [[ -d "$ROOT/.beads" ]]; then
+    BEADS_ACTION=existing
+    BEADS_DIR="$ROOT/.beads"
+    CONF_PATH="$BEADS_DIR/cycle.conf"
+    return 0
+  fi
+  if [[ -d "$ROOT/beads" ]]; then
+    BEADS_ACTION=existing
+    BEADS_DIR="$ROOT/beads"
+    CONF_PATH="$BEADS_DIR/cycle.conf"
+    return 0
+  fi
+
+  BEADS_DIR="$ROOT/.beads"
+  CONF_PATH="$BEADS_DIR/cycle.conf"
+
+  if [[ "$CREATE_BEADS" -eq 1 ]]; then
+    BEADS_ACTION=mkdir
+    return 0
+  fi
+  if [[ "$BD_INIT" -eq 1 ]]; then
+    BEADS_ACTION=bd-init
+    return 0
+  fi
+
+  if [[ "$YES" -eq 1 ]] || ! is_tty; then
+    die "no .beads/ or beads/ in $ROOT (pass --create-beads, --bd-init, or run interactively)"
+  fi
+
+  log "No Beads directory found in $ROOT."
+  log "  1) Create .beads/ (write cycle.conf only; you can run bd init later)"
+  log "  2) Run bd init (bd's own wizard), then write cycle.conf"
+  log "  3) Abort"
+  local choice
+  choice=$(prompt_line "Choice" "1")
+  case "$choice" in
+    1) BEADS_ACTION=mkdir ;;
+    2) BEADS_ACTION=bd-init ;;
+    3|q|Q|abort|Abort) die "aborted" ;;
+    *) die "unknown choice: $choice (expected 1, 2, or 3)" ;;
+  esac
+}
+
+normalize_script_dest() {
+  local spec=$1
+  local dest
+  if [[ "$spec" == /* ]]; then
+    dest=$spec
+  else
+    dest="$ROOT/$spec"
+  fi
+  if [[ "$dest" == */ ]]; then
+    dest="${dest}bead-cycle"
+  elif [[ -d "$dest" ]]; then
+    dest="$dest/bead-cycle"
+  elif [[ "$(basename "$dest")" == "bead-cycle" ]]; then
+    :
+  else
+    dest="$dest/bead-cycle"
+  fi
+  printf '%s' "$dest"
+}
+
+choose_script_dest() {
+  if [[ -n "$OPT_SCRIPT_DIR" ]]; then
+    SCRIPT_DEST=$(normalize_script_dest "$OPT_SCRIPT_DIR")
+    return 0
+  fi
+  if [[ -d "$ROOT/scripts" ]]; then
+    SCRIPT_DEST="$ROOT/scripts/bead-cycle"
+    return 0
+  fi
+  if [[ "$YES" -eq 1 ]]; then
+    SCRIPT_DEST="$ROOT/scripts/bead-cycle"
+    return 0
+  fi
+  log "No scripts/ directory in $ROOT."
+  local spec
+  spec=$(prompt_line "Install bead-cycle where? (repo-relative; default creates scripts/)" "scripts")
+  [[ -n "$spec" ]] || spec=scripts
+  SCRIPT_DEST=$(normalize_script_dest "$spec")
+}
+
+decide_write() {
+  local path=$1
+  local var=$2
+  if [[ ! -e "$path" ]]; then
+    printf -v "$var" '%s' 1
+    return 0
+  fi
+  if [[ "$FORCE" -eq 1 ]]; then
+    printf -v "$var" '%s' 1
+    return 0
+  fi
+  if [[ "$YES" -eq 1 ]]; then
+    log "keeping existing $path"
+    printf -v "$var" '%s' 0
+    return 0
+  fi
+  if ! is_tty; then
+    die "refusing to overwrite $path (pass --force, or --yes to keep it)"
+  fi
+  if prompt_yn "Overwrite $path?" n; then
+    printf -v "$var" '%s' 1
+  else
+    log "keeping existing $path"
+    printf -v "$var" '%s' 0
+  fi
+}
+
+choose_beads_dir
+choose_script_dest
+decide_write "$CONF_PATH" WRITE_CONF
+decide_write "$SCRIPT_DEST" WRITE_SCRIPT
+
+if [[ -d "$SCRIPT_DEST" ]]; then
+  die "script destination is a directory: $SCRIPT_DEST"
+fi
+
+collect_config() {
+  CONF_REVIEWER=$(prompt_core_key BEAD_CYCLE_REVIEWER \
+    'copilot-pull-request-reviewer[bot]' \
+    'Reviewer login used to request a review and to match reviews/threads.')
+  CONF_BRANCH_PREFIX=$(prompt_core_key BEAD_CYCLE_BRANCH_PREFIX \
+    'feat/' \
+    'Branch prefix for implement worktrees and PRs.')
+  CONF_MERGE_METHODS=$(prompt_core_key BEAD_CYCLE_MERGE_METHODS \
+    'squash,merge' \
+    'Comma list of merge methods to try: squash, merge, rebase.')
+  CONF_MAX_ROUNDS=$(prompt_core_key BEAD_CYCLE_MAX_ROUNDS \
+    '5' \
+    'Copilot fix/re-review cycles.')
+  CONF_MAX_TURNS=$(prompt_core_key BEAD_CYCLE_MAX_TURNS \
+    '80' \
+    'Per Grok invocation turn cap.')
+  CONF_POLL_SECONDS=$(prompt_core_key BEAD_CYCLE_POLL_SECONDS \
+    '15' \
+    'Copilot/CI poll interval in seconds.')
+  CONF_REVIEW_TIMEOUT=$(prompt_core_key BEAD_CYCLE_REVIEW_TIMEOUT \
+    '600' \
+    'Seconds to wait for a Copilot review.')
+  CONF_CI_TIMEOUT=$(prompt_core_key BEAD_CYCLE_CI_TIMEOUT \
+    '1200' \
+    'Seconds to wait for CI before merge.')
+  CONF_MAX_BEADS=$(prompt_core_key BEAD_CYCLE_MAX_BEADS \
+    '40' \
+    'Drain safety cap (max beads per --drain run).')
+
+  if [[ "$YES" -eq 1 ]]; then
+    if is_var_set BEAD_CYCLE_DRAIN_ID_MAP ||
+      is_var_set BEAD_CYCLE_DRAIN_ID_MAP_EPIC_KEY ||
+      is_var_set BEAD_CYCLE_DRAIN_ID_MAP_CLOSE_KEY ||
+      is_var_set BEAD_CYCLE_DRAIN_WRITEUP_GLOB ||
+      is_var_set BEAD_CYCLE_DRAIN_WRITEUP_HEADINGS ||
+      is_var_set BEAD_CYCLE_DRAIN_WRITEUP_N_MIN ||
+      is_var_set BEAD_CYCLE_DRAIN_WRITEUP_N_MAX ||
+      is_var_set BEAD_CYCLE_DRAIN_CHANGESET_GLOB; then
+      WANT_DRAIN=1
+    else
+      WANT_DRAIN=0
+    fi
+  else
+    if prompt_yn "Configure extra --drain close-out gates?" n; then
+      WANT_DRAIN=1
+    else
+      WANT_DRAIN=0
+    fi
+  fi
+
+  if [[ "$WANT_DRAIN" -eq 1 ]]; then
+    CONF_DRAIN_ID_MAP=$(prompt_drain_key BEAD_CYCLE_DRAIN_ID_MAP \
+      '' \
+      'Origin path to JSON id map (empty = skip this gate).')
+    if [[ -n "$CONF_DRAIN_ID_MAP" ]]; then
+      CONF_DRAIN_ID_MAP_EPIC_KEY=$(prompt_drain_key BEAD_CYCLE_DRAIN_ID_MAP_EPIC_KEY \
+        'e{n}' \
+        'Id-map epic key template ({n} unpadded, {nn} two-digit).')
+      CONF_DRAIN_ID_MAP_CLOSE_KEY=$(prompt_drain_key BEAD_CYCLE_DRAIN_ID_MAP_CLOSE_KEY \
+        'e{n}-close' \
+        'Id-map close-out child key template.')
+      [[ -n "$CONF_DRAIN_ID_MAP_EPIC_KEY" ]] || CONF_DRAIN_ID_MAP_EPIC_KEY='e{n}'
+      [[ -n "$CONF_DRAIN_ID_MAP_CLOSE_KEY" ]] || CONF_DRAIN_ID_MAP_CLOSE_KEY='e{n}-close'
+    else
+      CONF_DRAIN_ID_MAP_EPIC_KEY=""
+      CONF_DRAIN_ID_MAP_CLOSE_KEY=""
+    fi
+    CONF_DRAIN_WRITEUP_GLOB=$(prompt_drain_key BEAD_CYCLE_DRAIN_WRITEUP_GLOB \
+      '' \
+      'Origin glob for epic write-up, e.g. docs/epics/E{nn}-*.md (empty = skip).')
+    CONF_DRAIN_WRITEUP_HEADINGS=$(prompt_drain_key BEAD_CYCLE_DRAIN_WRITEUP_HEADINGS \
+      '' \
+      'Comma list of required write-up heading prefixes (empty = none).')
+    CONF_DRAIN_WRITEUP_N_MIN=$(prompt_drain_key BEAD_CYCLE_DRAIN_WRITEUP_N_MIN \
+      '' \
+      'Inclusive epic-number floor (empty = none).')
+    CONF_DRAIN_WRITEUP_N_MAX=$(prompt_drain_key BEAD_CYCLE_DRAIN_WRITEUP_N_MAX \
+      '' \
+      'Inclusive epic-number ceiling (empty = none).')
+    CONF_DRAIN_CHANGESET_GLOB=$(prompt_drain_key BEAD_CYCLE_DRAIN_CHANGESET_GLOB \
+      '' \
+      'Origin glob for changeset files, e.g. .changeset/*.md (empty = skip).')
+  fi
+}
+
+validate_config() {
+  local methods n
+  CONF_REVIEWER=$(trim_ws "$CONF_REVIEWER")
+  CONF_BRANCH_PREFIX=$(trim_ws "$CONF_BRANCH_PREFIX")
+  [[ -n "$CONF_REVIEWER" ]] || die "BEAD_CYCLE_REVIEWER must not be empty"
+
+  if [[ -n "$CONF_BRANCH_PREFIX" && "$CONF_BRANCH_PREFIX" != */ ]]; then
+    CONF_BRANCH_PREFIX="${CONF_BRANCH_PREFIX}/"
+  fi
+
+  if ! methods=$(normalize_merge_methods "$CONF_MERGE_METHODS"); then
+    die "BEAD_CYCLE_MERGE_METHODS must be a comma list of squash, merge, rebase"
+  fi
+  CONF_MERGE_METHODS=$methods
+
+  if ! n=$(decimal_int "$CONF_MAX_ROUNDS"); then
+    die "BEAD_CYCLE_MAX_ROUNDS must be an integer"
+  fi
+  CONF_MAX_ROUNDS=$n
+  if ! n=$(decimal_int "$CONF_MAX_TURNS"); then
+    die "BEAD_CYCLE_MAX_TURNS must be an integer"
+  fi
+  CONF_MAX_TURNS=$n
+  if ! n=$(decimal_int "$CONF_POLL_SECONDS"); then
+    die "BEAD_CYCLE_POLL_SECONDS must be an integer"
+  fi
+  CONF_POLL_SECONDS=$n
+  if ! n=$(decimal_int "$CONF_REVIEW_TIMEOUT"); then
+    die "BEAD_CYCLE_REVIEW_TIMEOUT must be an integer"
+  fi
+  CONF_REVIEW_TIMEOUT=$n
+  if ! n=$(decimal_int "$CONF_CI_TIMEOUT"); then
+    die "BEAD_CYCLE_CI_TIMEOUT must be an integer"
+  fi
+  CONF_CI_TIMEOUT=$n
+  if ! n=$(decimal_int "$CONF_MAX_BEADS"); then
+    die "BEAD_CYCLE_MAX_BEADS must be an integer"
+  fi
+  CONF_MAX_BEADS=$n
+  (( CONF_MAX_BEADS >= 1 )) || die "BEAD_CYCLE_MAX_BEADS must be >= 1"
+
+  if [[ -n "$CONF_DRAIN_WRITEUP_N_MIN" ]]; then
+    n=$(decimal_int "$CONF_DRAIN_WRITEUP_N_MIN") \
+      || die "BEAD_CYCLE_DRAIN_WRITEUP_N_MIN must be an integer"
+    CONF_DRAIN_WRITEUP_N_MIN=$n
+  fi
+  if [[ -n "$CONF_DRAIN_WRITEUP_N_MAX" ]]; then
+    n=$(decimal_int "$CONF_DRAIN_WRITEUP_N_MAX") \
+      || die "BEAD_CYCLE_DRAIN_WRITEUP_N_MAX must be an integer"
+    CONF_DRAIN_WRITEUP_N_MAX=$n
+  fi
+}
+
+emit_cycle_conf() {
+  cat <<EOF
+# Optional bead-cycle config. Written by bead-cycler scripts/init.
+# KEY=VALUE only. Not sourced. Environment BEAD_CYCLE_* wins over this
+# file; CLI flags win over both. --drain always requires at least one
+# child, every descendant closed, and eligible_for_close. Extra gates
+# below apply when these keys are set (file or BEAD_CYCLE_DRAIN_* env;
+# env wins). Unset extra drain keys and leave those env vars unset to
+# keep generic close-out.
+
+# Reviewer login used to request a review and to match reviews/threads.
+# Trailing [bot] is optional; GitHub often omits it on .user.login.
+BEAD_CYCLE_REVIEWER=$(conf_quote "$CONF_REVIEWER")
+BEAD_CYCLE_BRANCH_PREFIX=$(conf_quote "$CONF_BRANCH_PREFIX")
+BEAD_CYCLE_MERGE_METHODS=$(conf_quote "$CONF_MERGE_METHODS")
+
+# Timeouts / caps (same names as env)
+BEAD_CYCLE_MAX_ROUNDS=$(conf_quote "$CONF_MAX_ROUNDS")
+BEAD_CYCLE_MAX_TURNS=$(conf_quote "$CONF_MAX_TURNS")
+BEAD_CYCLE_POLL_SECONDS=$(conf_quote "$CONF_POLL_SECONDS")
+BEAD_CYCLE_REVIEW_TIMEOUT=$(conf_quote "$CONF_REVIEW_TIMEOUT")
+BEAD_CYCLE_CI_TIMEOUT=$(conf_quote "$CONF_CI_TIMEOUT")
+BEAD_CYCLE_MAX_BEADS=$(conf_quote "$CONF_MAX_BEADS")
+
+# Extra --drain gates. {n} = unpadded epic number; {nn} = two-digit.
+# Origin/<default-branch> is the only artifact source.
+#
+# Example: Gitdown ADR 10 (id-map close-out child, epic write-up, changeset)
+EOF
+  if [[ -n "$CONF_DRAIN_ID_MAP" ]]; then
+    printf 'BEAD_CYCLE_DRAIN_ID_MAP=%s\n' "$(conf_quote "$CONF_DRAIN_ID_MAP")"
+  else
+    printf '# BEAD_CYCLE_DRAIN_ID_MAP=beads/id-map.json\n'
+  fi
+  if [[ -n "$CONF_DRAIN_ID_MAP_EPIC_KEY" ]]; then
+    printf 'BEAD_CYCLE_DRAIN_ID_MAP_EPIC_KEY=%s\n' "$(conf_quote "$CONF_DRAIN_ID_MAP_EPIC_KEY")"
+  else
+    printf '# BEAD_CYCLE_DRAIN_ID_MAP_EPIC_KEY=e{n}\n'
+  fi
+  if [[ -n "$CONF_DRAIN_ID_MAP_CLOSE_KEY" ]]; then
+    printf 'BEAD_CYCLE_DRAIN_ID_MAP_CLOSE_KEY=%s\n' "$(conf_quote "$CONF_DRAIN_ID_MAP_CLOSE_KEY")"
+  else
+    printf '# BEAD_CYCLE_DRAIN_ID_MAP_CLOSE_KEY=e{n}-close\n'
+  fi
+  if [[ -n "$CONF_DRAIN_WRITEUP_GLOB" ]]; then
+    printf 'BEAD_CYCLE_DRAIN_WRITEUP_GLOB=%s\n' "$(conf_quote "$CONF_DRAIN_WRITEUP_GLOB")"
+  else
+    printf '# BEAD_CYCLE_DRAIN_WRITEUP_GLOB=docs/epics/E{nn}-*.md\n'
+  fi
+  if [[ -n "$CONF_DRAIN_WRITEUP_HEADINGS" ]]; then
+    printf 'BEAD_CYCLE_DRAIN_WRITEUP_HEADINGS=%s\n' "$(conf_quote "$CONF_DRAIN_WRITEUP_HEADINGS")"
+  else
+    printf '# BEAD_CYCLE_DRAIN_WRITEUP_HEADINGS=Features,How to test,Changelist\n'
+  fi
+  if [[ -n "$CONF_DRAIN_WRITEUP_N_MIN" ]]; then
+    printf 'BEAD_CYCLE_DRAIN_WRITEUP_N_MIN=%s\n' "$(conf_quote "$CONF_DRAIN_WRITEUP_N_MIN")"
+  else
+    printf '# BEAD_CYCLE_DRAIN_WRITEUP_N_MIN=1\n'
+  fi
+  if [[ -n "$CONF_DRAIN_WRITEUP_N_MAX" ]]; then
+    printf 'BEAD_CYCLE_DRAIN_WRITEUP_N_MAX=%s\n' "$(conf_quote "$CONF_DRAIN_WRITEUP_N_MAX")"
+  else
+    printf '# BEAD_CYCLE_DRAIN_WRITEUP_N_MAX=10\n'
+  fi
+  if [[ -n "$CONF_DRAIN_CHANGESET_GLOB" ]]; then
+    printf 'BEAD_CYCLE_DRAIN_CHANGESET_GLOB=%s\n' "$(conf_quote "$CONF_DRAIN_CHANGESET_GLOB")"
+  else
+    printf '# BEAD_CYCLE_DRAIN_CHANGESET_GLOB=.changeset/*.md\n'
+  fi
+}
+
+if [[ "$WRITE_CONF" -eq 1 ]]; then
+  collect_config
+  validate_config
+fi
+
+ensure_beads_dir() {
+  case "$BEADS_ACTION" in
+    existing)
+      return 0
+      ;;
+    mkdir)
+      if [[ "$DRY_RUN" -eq 1 ]]; then
+        log "would mkdir $BEADS_DIR"
+        return 0
+      fi
+      mkdir -p "$BEADS_DIR"
+      warn "created $BEADS_DIR; bd is not initialized (run bd init when ready)"
+      ;;
+    bd-init)
+      if [[ "$DRY_RUN" -eq 1 ]]; then
+        if [[ "$YES" -eq 1 || "$BD_INIT" -eq 1 ]]; then
+          log "would run: bd init --non-interactive  (in $ROOT)"
+        else
+          log "would run: bd init  (in $ROOT)"
+        fi
+        return 0
+      fi
+      need_cmd bd
+      if [[ "$YES" -eq 1 || "$BD_INIT" -eq 1 ]]; then
+        if ! (cd "$ROOT" && bd init --non-interactive); then
+          die "bd init --non-interactive failed in $ROOT"
+        fi
+      else
+        if ! (cd "$ROOT" && bd init); then
+          die "bd init failed in $ROOT"
+        fi
+      fi
+      if [[ ! -d "$ROOT/.beads" && ! -d "$ROOT/beads" ]]; then
+        die "bd init completed but no .beads/ or beads/ directory exists in $ROOT"
+      fi
+      if [[ -d "$ROOT/.beads" ]]; then
+        BEADS_DIR="$ROOT/.beads"
+      else
+        BEADS_DIR="$ROOT/beads"
+      fi
+      CONF_PATH="$BEADS_DIR/cycle.conf"
+      ;;
+    *)
+      die "internal error: unknown beads action: $BEADS_ACTION"
+      ;;
+  esac
+}
+
+write_conf_file() {
+  local tmp
+  if [[ "$DRY_RUN" -eq 1 ]]; then
+    log "would write $CONF_PATH"
+    return 0
+  fi
+  mkdir -p "$BEADS_DIR"
+  tmp=$(mktemp "$BEADS_DIR/cycle.conf.XXXXXX")
+  if ! emit_cycle_conf >"$tmp"; then
+    rm -f "$tmp"
+    die "could not write $CONF_PATH"
+  fi
+  if ! mv "$tmp" "$CONF_PATH"; then
+    rm -f "$tmp"
+    die "could not write $CONF_PATH"
+  fi
+  log "wrote $CONF_PATH"
+}
+
+copy_script() {
+  local dest_dir
+  dest_dir=$(dirname "$SCRIPT_DEST")
+  if [[ "$DRY_RUN" -eq 1 ]]; then
+    log "would copy $SOURCE_CYCLE -> $SCRIPT_DEST"
+    return 0
+  fi
+  mkdir -p "$dest_dir"
+  if ! cp "$SOURCE_CYCLE" "$SCRIPT_DEST"; then
+    die "could not copy bead-cycle to $SCRIPT_DEST"
+  fi
+  chmod +x "$SCRIPT_DEST"
+  log "copied $SCRIPT_DEST"
+}
+
+# Beads dir first so a failed bd init does not leave a copied script behind.
+if [[ "$WRITE_CONF" -eq 1 ]]; then
+  ensure_beads_dir
+  write_conf_file
+elif [[ "$BEADS_ACTION" != existing ]]; then
+  # Conf skipped but we still promised to create the beads dir (should not
+  # happen: a missing dir means cycle.conf does not exist yet).
+  ensure_beads_dir
+fi
+
+if [[ "$WRITE_SCRIPT" -eq 1 ]]; then
+  copy_script
+fi
+
+warn_missing_tools() {
+  local cmd
+  for cmd in bd gh jq git grok; do
+    if ! command -v "$cmd" >/dev/null 2>&1; then
+      warn "missing $cmd (needed to run bead-cycle)"
+    fi
+  done
+}
+
+warn_missing_tools
+
+rel_script=${SCRIPT_DEST#"$ROOT"/}
+if [[ "$rel_script" == "$SCRIPT_DEST" ]]; then
+  rel_script=$SCRIPT_DEST
+else
+  rel_script="./$rel_script"
+fi
+
+if [[ "$DRY_RUN" -eq 1 ]]; then
+  printf 'Would install:\n'
+else
+  printf 'Installed:\n'
+fi
+printf '  %s\n' "$CONF_PATH"
+printf '  %s\n' "$SCRIPT_DEST"
+printf '\nNext:\n'
+printf '  cd %s\n' "$ROOT"
+printf '  %s --help\n' "$rel_script"
