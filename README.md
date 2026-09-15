@@ -2,7 +2,7 @@
 
 Drop-in host autopilot for a [Beads](https://github.com/gastownhall/beads) repo on GitHub.
 
-The script claims (or resumes) one implementable bead, asks [Grok](https://grok.x.ai/) to implement it and open a PR, then **bash** polls GitHub Copilot review comments and only starts another Grok session when there are unresolved threads. After Copilot is green it waits for CI, merges if allowed, and closes the bead.
+The script claims (or resumes) one implementable bead, asks [Grok](https://grok.x.ai/) to implement it and open a PR, then **bash** polls GitHub Copilot. It starts another Grok session when there are unresolved threads, or when a "Needs a Closer Look" (or similar) overview lists suppressed comments with no threads. An overview with neither is treated as green. After Copilot is green it waits for CI, merges if allowed, and closes the bead.
 
 Copy `scripts/bead-cycle` into another Beads repo and run it. No other files are required. Optional `.beads/cycle.conf` (or `beads/cycle.conf`) turns on extra `--drain` close-out gates.
 
@@ -50,13 +50,13 @@ while ./scripts/bead-cycle; do :; done
 
 ## Default `--drain` close-out
 
-With no extra config, `--drain <epic-id>` closes the epic iff:
+`--drain` always requires at least one child, every descendant closed, and `eligible_for_close`. With no extra config, `--drain <epic-id>` closes the epic iff:
 
 - every descendant is closed (including nested epics/milestones)
 - `bd epic status` reports `eligible_for_close` (open epics only)
 - the epic has at least one child
 
-It never calls `bd epic close-eligible` (that would close every eligible epic).
+Extra gates apply only when the corresponding keys are set in `.beads/cycle.conf` or `BEAD_CYCLE_DRAIN_*` environment variables (env wins over the file). It never calls `bd epic close-eligible` (that would close every eligible epic).
 
 ## Optional config
 
