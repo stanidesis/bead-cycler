@@ -5,6 +5,27 @@ set -euo pipefail
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 INIT="$ROOT/scripts/init"
 
+# Init's --yes path treats these as pre-fills. Unset so default assertions
+# are stable; tests that need a value prefix it on the init command.
+unset \
+  BEAD_CYCLE_REVIEWER \
+  BEAD_CYCLE_BRANCH_PREFIX \
+  BEAD_CYCLE_MERGE_METHODS \
+  BEAD_CYCLE_MAX_ROUNDS \
+  BEAD_CYCLE_MAX_TURNS \
+  BEAD_CYCLE_POLL_SECONDS \
+  BEAD_CYCLE_REVIEW_TIMEOUT \
+  BEAD_CYCLE_CI_TIMEOUT \
+  BEAD_CYCLE_MAX_BEADS \
+  BEAD_CYCLE_DRAIN_ID_MAP \
+  BEAD_CYCLE_DRAIN_ID_MAP_EPIC_KEY \
+  BEAD_CYCLE_DRAIN_ID_MAP_CLOSE_KEY \
+  BEAD_CYCLE_DRAIN_WRITEUP_GLOB \
+  BEAD_CYCLE_DRAIN_WRITEUP_HEADINGS \
+  BEAD_CYCLE_DRAIN_WRITEUP_N_MIN \
+  BEAD_CYCLE_DRAIN_WRITEUP_N_MAX \
+  BEAD_CYCLE_DRAIN_CHANGESET_GLOB
+
 TESTS_RUN=0
 TESTS_FAIL=0
 CURRENT=""
@@ -19,12 +40,18 @@ pass() {
 }
 
 run_test() {
+  local st
   CURRENT=$1
   TESTS_RUN=$((TESTS_RUN + 1))
-  if ( set -euo pipefail; "$1" ); then
+  # set -e is ignored for the test command of `if`; run the case as a
+  # standalone subshell so grep/assert/cmp failures actually fail.
+  set +e
+  ( set -euo pipefail; "$1" )
+  st=$?
+  set -e
+  if [[ "$st" -eq 0 ]]; then
     pass
   else
-    # The subshell already failed; name is enough. fail() would double-count.
     printf 'not ok %s %s\n' "$TESTS_RUN" "$CURRENT"
     TESTS_FAIL=$((TESTS_FAIL + 1))
   fi
@@ -237,6 +264,20 @@ test_env_prefill_yes() {
   rm -rf "$tmp"
 }
 
+test_unquotable_value_no_writes() {
+  local tmp
+  tmp=$(mktemp -d)
+  make_repo "$tmp"
+  if BEAD_CYCLE_REVIEWER='foo "bar" baz' bash "$INIT" --yes --dir "$tmp" --create-beads >/dev/null 2>&1; then
+    rm -rf "$tmp"
+    printf 'expected unquotable REVIEWER to fail\n' >&2
+    return 1
+  fi
+  assert test ! -e "$tmp/.beads"
+  assert test ! -e "$tmp/scripts"
+  rm -rf "$tmp"
+}
+
 run_test test_help
 run_test test_unknown_flag
 run_test test_create_beads_and_bd_init_exclusive
@@ -253,6 +294,7 @@ run_test test_bad_merge_methods_env_no_writes
 run_test test_legacy_beads_dir
 run_test test_script_dir_flag
 run_test test_env_prefill_yes
+run_test test_unquotable_value_no_writes
 
 printf '\n%s tests, %s failed\n' "$TESTS_RUN" "$TESTS_FAIL"
 [[ "$TESTS_FAIL" -eq 0 ]]
