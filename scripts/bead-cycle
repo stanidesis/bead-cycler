@@ -1621,8 +1621,17 @@ parse_suppressed_comments() {
     }
     # Track fences before the section too. A "## Suppressed comments"
     # example inside an earlier fenced block is not a real section.
-    trimmed ~ /^```/ {
-      incode = 1 - incode
+    # GitHub Markdown allows both backtick (```) and tilde (~~~) fences;
+    # only the same character closes an open fence.
+    trimmed ~ /^(```+|~~~+)/ {
+      ch = substr(trimmed, 1, 1)
+      if (incode == 0) {
+        incode = 1
+        fencech = ch
+      } else if (ch == fencech) {
+        incode = 0
+        fencech = ""
+      }
       next
     }
     incode { next }
