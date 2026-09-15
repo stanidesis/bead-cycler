@@ -82,7 +82,10 @@ epics are ignored. Default is one child per invocation.
      non-flat. The post-run summary ready count is informational and does
      not change the cycle exit code.
   2. Ask Grok to implement (or continue) it, open a PR, and request Copilot
-  3. Poll Copilot; if it leaves comments, ask Grok to fix and re-request
+  3. Poll Copilot; if it leaves unresolved threads, ask Grok to fix and
+     re-request. A "Needs a Closer Look" (or similar) overview with no
+     unresolved threads still goes to Grok when that review lists
+     suppressed comments; if it lists none, treat Copilot as green
   4. Repeat until Copilot is green or the round cap is hit
   5. Merge if allowed and close the bead (not the parent epic, unless --drain)
 
@@ -91,7 +94,8 @@ closes the epic if and only if:
   - every descendant is closed (not only direct children; also
     bd epic status eligible_for_close)
   - the epic has at least one child
-Optional extra gates from .beads/cycle.conf (or beads/cycle.conf), if set:
+Optional extra gates from .beads/cycle.conf (or beads/cycle.conf) or
+BEAD_CYCLE_DRAIN_* environment variables (env wins over the file), if set:
   - mapped close-out child from origin/<default-branch>:<id-map> is a
     descendant and is closed (do not infer by title; do not use a local
     or stale working-copy map; the epic key must map to this epic id)
@@ -285,7 +289,7 @@ glob_to_path_regex() {
     c=${glob:i:1}
     case "$c" in
       '*') out="${out}[^/]+" ;;
-      '.'|'['|']'|'^'|'$'|'\\'|'|'|'+'|'('|')'|'{'|'}'|'?') out="${out}\\${c}" ;;
+      "\\"|'.'|'['|']'|'^'|'$'|'|'|'+'|'('|')'|'{'|'}'|'?') out="${out}\\${c}" ;;
       *) out="${out}${c}" ;;
     esac
     i=$((i + 1))
@@ -299,7 +303,7 @@ regex_escape() {
   while (( i < len )); do
     c=${s:i:1}
     case "$c" in
-      '.'|'['|']'|'^'|'$'|'\\'|'|'|'*'|'+'|'('|')'|'{'|'}'|'?') out="${out}\\${c}" ;;
+      "\\"|'.'|'['|']'|'^'|'$'|'|'|'*'|'+'|'('|')'|'{'|'}'|'?') out="${out}\\${c}" ;;
       *) out="${out}${c}" ;;
     esac
     i=$((i + 1))
@@ -445,8 +449,24 @@ if [[ -n "$BRANCH_PREFIX" && "$BRANCH_PREFIX" != */ ]]; then
   BRANCH_PREFIX="${BRANCH_PREFIX}/"
 fi
 
-# Env and --max-beads both go through arithmetic later (`(( completed <
-# MAX_BEADS ))`). Normalize so 08/09 are decimal, not invalid octal.
+# Env, cycle.conf, and CLI all reach arithmetic (`(( completed < MAX_BEADS ))`)
+# or `sleep`. Normalize so 08/09 are decimal, not invalid octal, and reject
+# non-integers from conf/env the same way CLI flags are rejected.
+if ! MAX_ROUNDS=$(decimal_int "$MAX_ROUNDS"); then
+  die "--max-rounds / BEAD_CYCLE_MAX_ROUNDS must be an integer"
+fi
+if ! MAX_TURNS=$(decimal_int "$MAX_TURNS"); then
+  die "--max-turns / BEAD_CYCLE_MAX_TURNS must be an integer"
+fi
+if ! POLL_SECONDS=$(decimal_int "$POLL_SECONDS"); then
+  die "--poll-seconds / BEAD_CYCLE_POLL_SECONDS must be an integer"
+fi
+if ! REVIEW_TIMEOUT=$(decimal_int "$REVIEW_TIMEOUT"); then
+  die "--review-timeout / BEAD_CYCLE_REVIEW_TIMEOUT must be an integer"
+fi
+if ! CI_TIMEOUT=$(decimal_int "$CI_TIMEOUT"); then
+  die "--ci-timeout / BEAD_CYCLE_CI_TIMEOUT must be an integer"
+fi
 if ! MAX_BEADS=$(decimal_int "$MAX_BEADS"); then
   die "--max-beads / BEAD_CYCLE_MAX_BEADS must be an integer"
 fi
@@ -1330,6 +1350,7 @@ fix_prompt() {
   local pr=$2
   local url=$3
   local round=$4
+  local review_body=${5-}
   cat <<EOF
 You are running unattended as part of bead-cycle, Copilot nurse round ${round} of ${MAX_ROUNDS}.
 
@@ -1340,9 +1361,16 @@ This may be a resumed run after an interruption. Checkout the existing PR branch
 (or grok worktree); do not start a new branch.
 
 Address every unresolved GitHub Copilot review comment on this PR.
+Copilot may post a review such as "Needs a Closer Look" with no GitHub
+threads and list findings only as "Suppressed comments" in that single
+review overview. Those suppressed comments are in scope too.
 - Checkout the PR branch.
-- Fix actionable Copilot comments in code, commit, and push.
+- Fix actionable Copilot comments (unresolved threads and suppressed
+  overview findings) in code, commit, and push.
 - Reply on threads only after the fix is pushed, referencing the commit SHA.
+  Suppressed comments have no thread; do not invent replies for them.
+- If there are no unresolved threads and the overview lists no suppressed
+  comments, do not invent work and do not push.
 - Do not start other beads. Do not merge. Do not close the bead.
 - After pushing, request another Copilot review:
   gh pr edit ${pr} --add-reviewer ${COPILOT_REVIEWER}
@@ -1352,6 +1380,11 @@ BEAD_CYCLE_RESULT={"status":"pr_open","bead_id":"${id}","pr_number":${pr},"pr_ur
 
 Use machine flags: --json --quiet --no-color. Never run bd edit.
 EOF
+  if [[ -n "$review_body" ]]; then
+    printf '%s\n' '--- latest Copilot review overview ---'
+    printf '%s\n' "$review_body"
+    printf '%s\n' '--- end Copilot review overview ---'
+  fi
 }
 
 GROK_CWD=""
@@ -1446,6 +1479,61 @@ review_is_approval() {
     return 0
   fi
   return 1
+}
+
+# Copilot's "Needs a Closer Look" (and similar) overviews can list findings
+# only in the review body. Match case-insensitively; emoji/punctuation around
+# the phrase is ignored by substring search.
+review_needs_closer_look() {
+  local body=$1
+  local lower
+  lower=$(printf '%s' "$body" | tr '[:upper:]' '[:lower:]')
+  [[ "$lower" == *"needs a closer look"* ]]
+}
+
+# Print one "path:line" per Copilot suppressed-comment entry in a review
+# overview. Empty stdout means none. Copilot titles the section as a
+# heading or <summary>; entries are **path:line**. Skip fenced code.
+suppressed_comment_lines() {
+  printf '%s\n' "$1" | awk '
+    function ltrim(s) { sub(/^[ \t]+/, "", s); return s }
+    function rtrim(s) { sub(/[ \t]+$/, "", s); return s }
+    function trim(s) { return rtrim(ltrim(s)) }
+    {
+      line = $0
+      sub(/\r$/, "", line)
+      trimmed = trim(line)
+      low = tolower(trimmed)
+    }
+    incode == 0 && (low ~ /^#{1,6}[ \t]+suppressed comments($|[ \t(])/ ||
+                    low ~ /^#{1,6}[ \t]+comments suppressed($|[ \t(])/ ||
+                    low ~ /^<summary>[ \t]*suppressed comments($|[ \t(])/ ||
+                    low ~ /^<summary>[ \t]*comments suppressed($|[ \t(])/) {
+      insec = 1
+      next
+    }
+    insec {
+      if (trimmed ~ /^```/) { incode = 1 - incode; next }
+      if (incode) next
+      if (trimmed ~ /^#{1,6}[ \t]/ || trimmed ~ /^<\/details>/ ||
+          trimmed ~ /^<details/ || low ~ /^<summary>/ ||
+          trimmed ~ /^- \*\*/) {
+        exit
+      }
+      if (trimmed ~ /^\*\*.+:[0-9]+\*\*[ \t]*$/) {
+        s = trimmed
+        sub(/^\*\*/, "", s)
+        sub(/\*\*[ \t]*$/, "", s)
+        print s
+      }
+    }
+  '
+}
+
+# Comma-joined sorted unique path:line ids. Empty if none. Caller must
+# check the result: a failed pipeline must not look like "no suppressed".
+suppressed_comment_id_set() {
+  suppressed_comment_lines "$1" | sort -u | paste -sd, -
 }
 
 copilot_unresolved_threads() {
@@ -2105,7 +2193,8 @@ matching_epic_docs() {
   glob=$(expand_n_tokens "$DRAIN_WRITEUP_GLOB" "$n")
   re=$(glob_to_path_regex "$glob") || return 1
   origin_hits=$(list_origin_paths) || return 2
-  printf '%s\n' "$origin_hits" | grep -E "$re" | grep -vE '/_template\.md$' || true
+  printf '%s\n' "$origin_hits" | grep -E "$re" \
+    | grep -vE "(^|/)$(regex_escape '_template.md')$" || true
 }
 
 matching_changesets() {
@@ -2114,7 +2203,7 @@ matching_changesets() {
   origin_hits=$(list_origin_paths) || return 2
   re=$(glob_to_path_regex "$DRAIN_CHANGESET_GLOB") || return 1
   printf '%s\n' "$origin_hits" | grep -E "$re" \
-    | grep -vE '/README\.md$' || true
+    | grep -vE "(^|/)$(regex_escape 'README.md')$" || true
 }
 
 # Drop CommonMark fenced code (``` / ~~~), HTML comments, and HTML blocks
@@ -2297,12 +2386,17 @@ evaluate_epic_close() {
   local total=0 closed=0 eligible="false" epic_status="" epic_n_ok=1
   # Pin origin immediately before this evaluation (including the
   # pre-close re-check and post-close verify). A concurrent push that
-  # removes the write-up or changeset must be visible.
-  if ! refresh_origin_tree; then
-    CLOSE_BLOCKERS="git fetch origin failed"
-    CLOSE_EVAL_ERROR=1
-    log "error: git fetch origin failed; refusing to evaluate close-out from a stale origin/${DEFAULT_BRANCH}"
-    return 2
+  # removes the write-up or changeset must be visible. Skip fetch when
+  # no origin artifact gates are configured so a repo without origin
+  # (or a transient fetch failure) can still close on descendants +
+  # eligible_for_close.
+  if [[ -n "$DRAIN_ID_MAP" || -n "$DRAIN_WRITEUP_GLOB" || -n "$DRAIN_CHANGESET_GLOB" ]]; then
+    if ! refresh_origin_tree; then
+      CLOSE_BLOCKERS="git fetch origin failed"
+      CLOSE_EVAL_ERROR=1
+      log "error: git fetch origin failed; refusing to evaluate close-out from a stale origin/${DEFAULT_BRANCH}"
+      return 2
+    fi
   fi
   show=$(bd_json show "$id") || {
     CLOSE_BLOCKERS="could not bd show ${id}"
@@ -2329,7 +2423,7 @@ evaluate_epic_close() {
       CLOSE_EVAL_ERROR=1
       return 2
     fi
-    if [[ -n "$n" ]] && ! epic_number_in_writeup_range "$n"; then
+    if [[ -n "$DRAIN_WRITEUP_GLOB" && -n "$n" ]] && ! epic_number_in_writeup_range "$n"; then
       local range_txt=""
       if [[ -n "$DRAIN_WRITEUP_N_MIN" && -n "$DRAIN_WRITEUP_N_MAX" ]]; then
         range_txt="${DRAIN_WRITEUP_N_MIN}–${DRAIN_WRITEUP_N_MAX}"
@@ -3115,6 +3209,7 @@ EOF
   COPILOT_STATUS="unknown"
   MERGE_STATUS="not attempted"
   PREV_IDS=""
+  PREV_SUPP_IDS=""
   LAST_REVIEW_ID=""
   FIRST_REVIEW=1
 
@@ -3180,39 +3275,80 @@ EOF
       rm -f "$OUT_FILE"
       return 1
     }
+    if ! SUPP_IDS=$(suppressed_comment_id_set "$REVIEW_BODY"); then
+      print_summary "$BEAD_ID" "$PR_URL" "failed to parse Copilot suppressed comments" "$ROUNDS_USED" "$MERGE_STATUS"
+      log "error: failed to parse Copilot suppressed comments on PR #${PR_NUMBER}"
+      rm -f "$OUT_FILE"
+      return 1
+    fi
+    if [[ -z "$SUPP_IDS" ]]; then
+      SUPP_COUNT=0
+    else
+      if ! SUPP_COUNT=$(printf '%s\n' "$SUPP_IDS" | awk -F, '{print NF}'); then
+        print_summary "$BEAD_ID" "$PR_URL" "failed to parse Copilot suppressed comments" "$ROUNDS_USED" "$MERGE_STATUS"
+        log "error: failed to count Copilot suppressed comments on PR #${PR_NUMBER}"
+        rm -f "$OUT_FILE"
+        return 1
+      fi
+    fi
+    [[ "$SUPP_COUNT" =~ ^[0-9]+$ ]] || {
+      print_summary "$BEAD_ID" "$PR_URL" "failed to parse Copilot suppressed comments" "$ROUNDS_USED" "$MERGE_STATUS"
+      log "error: Copilot suppressed comment count is not an integer on PR #${PR_NUMBER}"
+      rm -f "$OUT_FILE"
+      return 1
+    }
 
-    log "Copilot review ${LAST_REVIEW_ID} state=${REVIEW_STATE} unresolved=${COUNT}"
+    log "Copilot review ${LAST_REVIEW_ID} state=${REVIEW_STATE} unresolved=${COUNT} suppressed=${SUPP_COUNT}"
 
     if review_is_approval "$REVIEW_STATE" "$REVIEW_BODY"; then
       COPILOT_STATUS="approved"
       break
     fi
-    if [[ "$COUNT" -eq 0 ]]; then
-      COPILOT_STATUS="no unresolved comments"
+    if [[ "$COUNT" -eq 0 && "$SUPP_COUNT" -eq 0 ]]; then
+      if review_needs_closer_look "$REVIEW_BODY"; then
+        COPILOT_STATUS="Needs a Closer Look (no suppressed comments)"
+      else
+        COPILOT_STATUS="no unresolved comments"
+      fi
       break
     fi
-    if [[ "$FIRST_REVIEW" -eq 0 && "$IDS" == "$PREV_IDS" ]]; then
+    if [[ "$COUNT" -eq 0 && "$SUPP_COUNT" -gt 0 && "$FIRST_REVIEW" -eq 0 && "$SUPP_IDS" == "$PREV_SUPP_IDS" ]]; then
+      COPILOT_STATUS="no new suppressed comments"
+      break
+    fi
+    if [[ "$COUNT" -gt 0 && "$FIRST_REVIEW" -eq 0 && "$IDS" == "$PREV_IDS" ]]; then
       COPILOT_STATUS="no new unresolved comments"
       break
     fi
     if (( ROUNDS_USED >= MAX_ROUNDS )); then
       COPILOT_STATUS="still blocking (round cap)"
-      log "unresolved Copilot threads:"
-      printf '%s' "$THREADS" | jq -r '.[] | "- \(.path): \(.url)\n  \(.body | split("\n")[0])"'
+      if [[ "$COUNT" -gt 0 ]]; then
+        log "unresolved Copilot threads:"
+        printf '%s' "$THREADS" | jq -r '.[] | "- \(.path): \(.url)\n  \(.body | split("\n")[0])"'
+      fi
+      if [[ "$SUPP_COUNT" -gt 0 ]]; then
+        log "suppressed Copilot comments:"
+        printf '%s\n' "$SUPP_IDS" | tr ',' '\n' | sed 's/^/- /'
+      fi
       print_summary "$BEAD_ID" "$PR_URL" "$COPILOT_STATUS" "$ROUNDS_USED" "$MERGE_STATUS"
       rm -f "$OUT_FILE"
       return 2
     fi
 
     ROUNDS_USED=$((ROUNDS_USED + 1))
-    log "==> fix round ${ROUNDS_USED}/${MAX_ROUNDS}"
+    if [[ "$COUNT" -eq 0 && "$SUPP_COUNT" -gt 0 ]]; then
+      log "==> fix round ${ROUNDS_USED}/${MAX_ROUNDS} (suppressed comments in Copilot overview)"
+    else
+      log "==> fix round ${ROUNDS_USED}/${MAX_ROUNDS}"
+    fi
     FIX_EC=0
-    run_grok "$(fix_prompt "$BEAD_ID" "$PR_NUMBER" "$PR_URL" "$ROUNDS_USED")" "$OUT_FILE" || FIX_EC=$?
+    run_grok "$(fix_prompt "$BEAD_ID" "$PR_NUMBER" "$PR_URL" "$ROUNDS_USED" "$REVIEW_BODY")" "$OUT_FILE" || FIX_EC=$?
     if [[ "$FIX_EC" -ne 0 ]]; then
       log "warning: Grok fix session exited ${FIX_EC}; continuing to re-request Copilot"
     fi
     request_copilot_review "$PR_NUMBER" || log "warning: could not re-request Copilot review"
     PREV_IDS=$IDS
+    PREV_SUPP_IDS=$SUPP_IDS
     FIRST_REVIEW=0
   done
 
