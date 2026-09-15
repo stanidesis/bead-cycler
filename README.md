@@ -2,7 +2,7 @@
 
 Drop-in host autopilot for a [Beads](https://github.com/gastownhall/beads) repo on GitHub.
 
-The script claims (or resumes) one implementable bead, asks [Grok](https://grok.x.ai/) to implement it and open a PR, then **bash** polls GitHub Copilot. It starts another Grok session when there are unresolved threads, or when a "Needs a Closer Look" (or similar) overview lists suppressed comments with no threads. An overview with neither is treated as green. After Copilot is green it waits for CI, merges if allowed, and closes the bead.
+The script claims (or resumes) one implementable bead, asks [Grok](https://grok.x.ai/) to implement it and open a PR, then **bash** polls the configured reviewer (`BEAD_CYCLE_REVIEWER`, default Copilot). It starts another Grok session when there are unresolved reviewer threads, or when a "Needs a Closer Look" (or similar) overview lists suppressed comments with no threads. An overview with neither is treated as green. An Approve (or unchanged unresolved threads) is not green while suppressed comments remain. The same suppressed path:line set after a Grok fix is still blocking; a suppressed-comments section that cannot be parsed is a hard failure. After the reviewer is green it waits for CI, merges if allowed, and closes the bead.
 
 Copy `scripts/bead-cycle` into another Beads repo and run it. No other files are required. Optional `.beads/cycle.conf` (or `beads/cycle.conf`) turns on extra `--drain` close-out gates.
 
@@ -11,7 +11,7 @@ Copy `scripts/bead-cycle` into another Beads repo and run it. No other files are
 | Tool | Why |
 |---|---|
 | `bd` | claim / show / ready / close |
-| `gh` (authenticated) | PRs, Copilot reviews, merge |
+| `gh` (authenticated) | PRs, reviewer polls, merge |
 | `jq` | JSON |
 | `git` | branches and worktrees |
 | `grok` CLI | implement + fix sessions |
@@ -45,7 +45,7 @@ Drain one-by-one without closing the epic:
 
 ```bash
 while ./scripts/bead-cycle; do :; done
-# stops on QUEUE_EMPTY (3), hard failure (1), or Copilot round cap (2)
+# stops on QUEUE_EMPTY (3), hard failure (1), or leftover reviewer comments (2)
 ```
 
 ## Default `--drain` close-out
@@ -91,7 +91,7 @@ BEAD_CYCLE_DRAIN_CHANGESET_GLOB=
 
 ## Prompts
 
-Grok prompts are self-contained (one claimed bead, branch prefix, Copilot reviewer, `BEAD_CYCLE_RESULT=…`). If `AGENTS.md` or `.grok/skills/bead-cycle/SKILL.md` exists in the target repo, the prompt also points at them. They are not required.
+Grok prompts are self-contained (one claimed bead, branch prefix, configured reviewer login, `BEAD_CYCLE_RESULT=…`). Fix prompts receive parsed path:line excerpts, not the raw review body. If `AGENTS.md` or `.grok/skills/bead-cycle/SKILL.md` exists in the target repo, the prompt also points at them. They are not required.
 
 ## Crash resume
 
