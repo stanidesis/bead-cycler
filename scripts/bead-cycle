@@ -910,58 +910,116 @@ normalize_pr_state() {
   esac
 }
 
-discover_pr() {
-  local id=$1
-  local result_json=${2:-}
-  local number url state merged info match
+# Shared by discover_pr / pr_list_matches_id. Head branch ${prefix}${id} or
+# ${prefix}${id}-* wins; title token match is only used when the head is not
+# under BRANCH_PREFIX (avoids a feat/other-id PR whose title mentions this id).
+jq_pr_match_defs='
+  def re_quote: gsub("(?<c>[\\\\.^$|?*+()\\[\\]{}])"; "\\\(.c)");
+  def pr_matches_bead($id; $prefix):
+    ((.headRefName // "") | test("^" + ($prefix | re_quote) + ($id | re_quote) + "(-|$)"))
+    or (
+      ((.title // "") | test("(^|[^A-Za-z0-9-])" + ($id | re_quote) + "([^A-Za-z0-9-]|$)"))
+      and (((.headRefName // "") | test("^" + ($prefix | re_quote))) | not)
+    );
+'
 
-  if [[ -n "$result_json" ]]; then
-    number=$(json_field "$result_json" '.pr_number // empty')
-    url=$(json_field "$result_json" '.pr_url // empty')
-    if [[ "$number" =~ ^[0-9]+$ ]]; then
-      info=$(gh pr view "$number" --json url,state,mergedAt 2>/dev/null || true)
-      if [[ -n "$info" ]]; then
-        url=$(printf '%s' "$info" | jq -r '.url // empty')
-        state=$(normalize_pr_state \
-          "$(printf '%s' "$info" | jq -r '.state // empty')" \
-          "$(printf '%s' "$info" | jq -r '.mergedAt // empty')")
-        if [[ -n "$url" && "$state" != "none" ]]; then
-          printf '%s\t%s\t%s\n' "$number" "$state" "$url"
-          return 0
-        fi
-      elif [[ -n "$url" && "$url" != "null" ]]; then
-        printf '%s\t%s\t%s\n' "$number" "open" "$url"
-        return 0
-      fi
-    fi
-  fi
+pr_object_matches_bead() {
+  local json=$1
+  local id=$2
+  printf '%s' "$json" | jq -e --arg id "$id" --arg prefix "$BRANCH_PREFIX" \
+    "${jq_pr_match_defs}pr_matches_bead(\$id; \$prefix)" >/dev/null 2>&1
+}
 
-  local prs
-  prs=$(gh pr list --state all --limit 80 --json number,url,headRefName,title,state,mergedAt)
-  match=$(printf '%s' "$prs" | jq -c --arg id "$id" --arg prefix "$BRANCH_PREFIX" '
-    def re_quote: gsub("(?<c>[\\\\.^$|?*+()\\[\\]{}])"; "\\\(.c)");
-    def matches:
-      (.headRefName | test("^" + ($prefix | re_quote) + ($id | re_quote) + "(-|$)"))
-      or (
-        (.title | test("(^|[^A-Za-z0-9-])" + ($id | re_quote) + "([^A-Za-z0-9-]|$)"))
-        and ((.headRefName | test("^" + ($prefix | re_quote))) | not)
-      );
-    [.[] | select(matches)]
+select_matching_pr() {
+  local prs=$1
+  local id=$2
+  printf '%s' "$prs" | jq -c --arg id "$id" --arg prefix "$BRANCH_PREFIX" \
+    "${jq_pr_match_defs}"'
+    [.[] | select(pr_matches_bead($id; $prefix))]
     | sort_by(
-        if .state == "OPEN" then 0
+        if (.state | ascii_upcase) == "OPEN" then 0
         elif .mergedAt != null then 1
         else 2 end
       )
     | first // empty
-  ')
-  if [[ -n "$match" ]]; then
-    number=$(printf '%s' "$match" | jq -r '.number')
-    url=$(printf '%s' "$match" | jq -r '.url')
-    state=$(normalize_pr_state \
-      "$(printf '%s' "$match" | jq -r '.state // empty')" \
-      "$(printf '%s' "$match" | jq -r '.mergedAt // empty')")
+  '
+}
+
+# Every repo PR (open + closed + merged). Paginate; do not cap at a
+# recent-results window so crash-resume can find an older matching PR.
+list_all_prs_json() {
+  local raw
+  raw=$(NO_COLOR=1 gh api --paginate --slurp \
+    "repos/${OWNER_REPO}/pulls?state=all&per_page=100") || return 1
+  printf '%s' "$raw" | jq '
+    if type != "array" then []
+    elif length == 0 then []
+    elif (.[0] | type) == "array" then add
+    else . end
+    | if . == null then [] else . end
+    | map({
+        number,
+        url: .html_url,
+        headRefName: (.head.ref // ""),
+        title,
+        state,
+        mergedAt: .merged_at
+      })
+  '
+}
+
+emit_discovered_pr() {
+  local json=$1
+  local number url state
+  number=$(printf '%s' "$json" | jq -r '.number')
+  url=$(printf '%s' "$json" | jq -r '.url // empty')
+  state=$(normalize_pr_state \
+    "$(printf '%s' "$json" | jq -r '.state // empty')" \
+    "$(printf '%s' "$json" | jq -r '.mergedAt // empty')")
+  if [[ -n "$number" && "$number" != "null" && -n "$url" && "$state" != "none" ]]; then
     printf '%s\t%s\t%s\n' "$number" "$state" "$url"
     return 0
+  fi
+  return 1
+}
+
+discover_pr() {
+  local id=$1
+  local result_json=${2:-}
+  local number info match prs page branch
+
+  if [[ -n "$result_json" ]]; then
+    number=$(json_field "$result_json" '.pr_number // empty')
+    if [[ "$number" =~ ^[0-9]+$ ]]; then
+      info=$(gh pr view "$number" --json url,state,mergedAt,headRefName,title 2>/dev/null || true)
+      if [[ -n "$info" ]]; then
+        if pr_object_matches_bead "$info" "$id"; then
+          emit_discovered_pr "$info" && return 0
+        else
+          log "warning: result PR #${number} is not associated with ${id}; ignoring"
+        fi
+      fi
+    fi
+  fi
+
+  # Prefer PRs whose head is a known ${prefix}${id}[-*] branch.
+  prs='[]'
+  while IFS= read -r branch; do
+    [[ -n "$branch" ]] || continue
+    page=$(gh pr list --head "$branch" --state all \
+      --json number,url,headRefName,title,state,mergedAt 2>/dev/null || echo '[]')
+    prs=$(printf '%s\n%s' "$prs" "$page" | jq -s 'add | unique_by(.number)')
+  done < <(matching_feat_branches "$id")
+
+  match=$(select_matching_pr "$prs" "$id" || true)
+  if [[ -n "$match" ]]; then
+    emit_discovered_pr "$match" && return 0
+  fi
+
+  prs=$(list_all_prs_json) || return 1
+  match=$(select_matching_pr "$prs" "$id" || true)
+  if [[ -n "$match" ]]; then
+    emit_discovered_pr "$match" && return 0
   fi
 
   return 1
@@ -986,17 +1044,27 @@ worktree_matches_id() {
     || feat_ref_matches_id "$branch_short" "$id"
 }
 
-feat_branch_for_id() {
+matching_feat_branches() {
   local id=$1
-  local ref short
+  local ref short seen="|"
   while IFS= read -r ref; do
     [[ -n "$ref" ]] || continue
     short=${ref#origin/}
-    if feat_ref_matches_id "$short" "$id"; then
-      printf '%s\n' "$short"
-      return 0
-    fi
+    feat_ref_matches_id "$short" "$id" || continue
+    [[ "$seen" == *"|${short}|"* ]] && continue
+    seen+="${short}|"
+    printf '%s\n' "$short"
   done < <(git for-each-ref --format='%(refname:short)' refs/heads refs/remotes/origin)
+}
+
+feat_branch_for_id() {
+  local id=$1
+  local short
+  while IFS= read -r short; do
+    [[ -n "$short" ]] || continue
+    printf '%s\n' "$short"
+    return 0
+  done < <(matching_feat_branches "$id")
   return 1
 }
 
@@ -1103,20 +1171,14 @@ pr_list_matches_id() {
   local prs=$1
   local id=$2
   local want=$3
-  printf '%s' "$prs" | jq -e --arg id "$id" --arg want "$want" --arg prefix "$BRANCH_PREFIX" '
-    def re_quote: gsub("(?<c>[\\\\.^$|?*+()\\[\\]{}])"; "\\\(.c)");
-    def matches:
-      (.headRefName | test("^" + ($prefix | re_quote) + ($id | re_quote) + "(-|$)"))
-      or (
-        (.title | test("(^|[^A-Za-z0-9-])" + ($id | re_quote) + "([^A-Za-z0-9-]|$)"))
-        and ((.headRefName | test("^" + ($prefix | re_quote))) | not)
-      );
+  printf '%s' "$prs" | jq -e --arg id "$id" --arg want "$want" --arg prefix "$BRANCH_PREFIX" \
+    "${jq_pr_match_defs}"'
     any(.[];
       (
-        ($want == "open" and .state == "OPEN")
-        or ($want == "merged" and (.mergedAt != null or .state == "MERGED"))
+        ($want == "open" and ((.state | ascii_upcase) == "OPEN"))
+        or ($want == "merged" and (.mergedAt != null or ((.state | ascii_upcase) == "MERGED")))
       )
-      and matches
+      and pr_matches_bead($id; $prefix)
     )
   ' >/dev/null 2>&1
 }
@@ -1137,7 +1199,7 @@ ranked_resume_ids() {
   (( ${#ids[@]} > 0 )) || return 0
 
   local prs
-  prs=$(gh pr list --state all --limit 80 --json number,url,headRefName,title,state,mergedAt 2>/dev/null || echo '[]')
+  prs=$(list_all_prs_json 2>/dev/null || echo '[]')
 
   emit_resume_id() {
     local x=$1
@@ -1472,10 +1534,12 @@ review_is_approval() {
   [[ "$state" == "APPROVED" ]] && return 0
   local lower
   lower=$(printf '%s' "$body" | tr '[:upper:]' '[:lower:]')
-  if [[ "$lower" == *"not ready"* ]]; then
+  # COMMENTED reviews: only the explicit Copilot green phrase. Do not
+  # substring-match "approved" (that matches "not approved").
+  if [[ "$lower" == *"not ready"* || "$lower" == *"not approved"* ]]; then
     return 1
   fi
-  if [[ "$lower" == *"ready to approve"* || "$lower" == *"approved"* ]]; then
+  if [[ "$lower" == *"ready to approve"* ]]; then
     return 0
   fi
   return 1
@@ -1644,7 +1708,9 @@ wait_for_copilot_review() {
       if [[ "$rstate" != "PENDING" ]]; then
         [[ -z "$after_id" || "$rid" != "$after_id" ]] && newer=1
         [[ -n "$rsha" && "$rsha" == "$head" ]] && on_head=1
-        if [[ "$newer" -eq 1 && ( "$on_head" -eq 1 || -z "$after_id" ) ]]; then
+        # Require the review commit to equal head even on the first wait
+        # so a resumed PR is not marked green from an older-commit review.
+        if [[ "$newer" -eq 1 && "$on_head" -eq 1 ]]; then
           printf '%s\n' "$review"
           return 0
         fi
@@ -1657,15 +1723,6 @@ wait_for_copilot_review() {
     sleep "$POLL_SECONDS"
   done
 
-  local reviews review rstate
-  reviews=$(copilot_reviews_json "$pr") || return 1
-  review=$(latest_copilot_review "$reviews") || true
-  rstate=$(printf '%s' "${review:-}" | jq -r '.state // empty' 2>/dev/null || true)
-  if [[ -n "$review" && "$rstate" != "PENDING" ]]; then
-    log "warning: timed out waiting for a new Copilot review; using latest existing review"
-    printf '%s\n' "$review"
-    return 0
-  fi
   return 1
 }
 
@@ -3145,10 +3202,7 @@ EOF
     fi
     log "warning: bd close failed; bead may already be closed"
     print_summary "$BEAD_ID" "$PR_URL" "n/a (already merged)" "0" "merge recorded, close failed"
-    if [[ "$DRAIN" -eq 1 ]]; then
-      return 1
-    fi
-    return 0
+    return 1
   fi
 
   # drain_epic invokes this as `run_one_bead || ...`, which disables
@@ -3300,7 +3354,8 @@ EOF
 
     log "Copilot review ${LAST_REVIEW_ID} state=${REVIEW_STATE} unresolved=${COUNT} suppressed=${SUPP_COUNT}"
 
-    if review_is_approval "$REVIEW_STATE" "$REVIEW_BODY"; then
+    if review_is_approval "$REVIEW_STATE" "$REVIEW_BODY" \
+      && [[ "$COUNT" -eq 0 && "$SUPP_COUNT" -eq 0 ]]; then
       COPILOT_STATUS="approved"
       break
     fi
