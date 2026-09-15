@@ -2,7 +2,7 @@
 
 Drop-in host autopilot for a [Beads](https://github.com/gastownhall/beads) repo on GitHub.
 
-The script claims (or resumes) one implementable bead, asks [Grok](https://grok.x.ai/) to implement it and open a PR, then **bash** polls the configured reviewer (`BEAD_CYCLE_REVIEWER`, default Copilot). It starts another Grok session when there are unresolved reviewer threads, or when a "Needs a Closer Look" (or similar) overview lists suppressed comments with no threads. An overview with neither is treated as green. An Approve (or unchanged unresolved threads) is not green while suppressed comments remain. The same suppressed path:line set after a Grok fix is still blocking; a suppressed-comments section that cannot be parsed is a hard failure. After the reviewer is green it waits for CI, merges if allowed, and closes the bead.
+The script claims (or resumes) one implementable bead, asks [Grok](https://grok.x.ai/) to implement it and open a PR, then **bash** polls the configured reviewer (`BEAD_CYCLE_REVIEWER`, default Copilot). It starts another Grok session when there are unresolved reviewer threads, or when a "Needs a Closer Look" (or similar) overview lists suppressed comments with no threads. An overview with neither is treated as green. An APPROVED review (or unchanged unresolved threads) is not green while suppressed comments remain. The same suppressed path:line set after a Grok fix is still blocking; a suppressed-comments section that cannot be parsed is a hard failure. After the reviewer is green it waits for CI, merges if allowed, and closes the bead.
 
 Copy `scripts/bead-cycle` into another Beads repo and run it. No other files are required. Optional `.beads/cycle.conf` (or `beads/cycle.conf`) turns on extra `--drain` close-out gates.
 
