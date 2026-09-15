@@ -1,0 +1,3532 @@
+#!/usr/bin/env bash
+# Host autopilot for one bead factory cycle in any Beads + GitHub repo.
+# Grok implements; this script nurses Copilot reviews in a bounded loop.
+# Re-running after a kill/crash resumes the same bead from git/GitHub/bd state.
+# Compatible with Bash 3.2 (stock macOS /usr/bin/env bash). No associative arrays.
+# Portable date: `date '+%Y-%m-%dT%H:%M:%S%z'` (stock macOS /bin/date has no GNU -Iseconds).
+# --drain <epic-id> walks remaining children, then closes the epic iff
+# every descendant is closed and bd reports eligible_for_close. Extra
+# close-out gates (id-map, write-up, changeset) come from cycle.conf.
+set -euo pipefail
+
+USE_WORKTREE=1
+DO_MERGE=1
+DRY_RUN=0
+DRAIN=0
+# Internal drain recovery log. Do not inherit from the environment: a
+# caller-set path would make --dry-run append (it must make no writes).
+DRAIN_LOG=""
+BEAD_ID=""
+SKIP_RUN=0
+# Set when BEAD_ID was an epic/milestone: ready/resume stay inside this parent.
+SCOPE_ID=""
+
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+REPO_ROOT=""
+
+usage() {
+  cat <<'EOF'
+Usage: bead-cycle [BEAD_ID] [options]
+
+Run one bead factory cycle from a normal shell (outside the Grok TUI).
+Drop this script into any Beads repo (typical path: ./scripts/bead-cycle).
+Re-running after a crash, Ctrl-C, or failed Grok session continues the
+same bead: in-progress issues, <prefix><id>-* branches/worktrees, and open
+PRs are reused. Implement is skipped when a PR is already open. A merged
+PR with a still-open bead is closed without another Grok session.
+
+Epics (and milestones) are grouping only — never claimed or implemented.
+Passing an epic id scopes this run to that epic's descendants: resume an
+in-progress child if one exists, else claim the next ready child. Other
+epics are ignored. Default is one child per invocation.
+
+  1. Resume the first implementable in-progress non-grouping bead (type-check
+     every candidate; skip epic/milestone/unknown). Else claim the highest-
+     priority ready item that is not issue_type: epic or milestone. Confirm
+     issue_type and status from
+     `bd show` before --claim (missing/non-string status is a parse failure,
+     not a claim). Auto-claim skips unknown types (empty/missing **or** a
+     string that is not in `bd types` — core plus configured custom types
+     — e.g. `wat`). An explicit BEAD_ID that is an epic scopes to children
+     (never claimed, including when the epic is already closed). An explicit
+     unknown type is a hard failure. Resolve the allowlist via `bd types
+     --json`; a types fetch/parse failure is a hard error (including a
+     response missing `core_types`, or with a non-array/empty `core_types`).
+     If no implementable non-epic ready item remains in scope (only epics,
+     milestones, and/or unknown-type issues), exit QUEUE_EMPTY. bd show/list/ready
+     errors (including JSON parse failures) are a hard failure, not
+     QUEUE_EMPTY. A failed `bd show` aborts immediately; it is not skipped
+     in favor of a later candidate. A `bd update --claim` *command* failure
+     of one candidate still continues to the next; if none succeed, that is
+     exit 1 (not QUEUE_EMPTY). A successful --claim whose JSON is
+     unparseable, whose issue_type is empty or not in `bd types`, or whose
+     status is missing/non-string/not in_progress is unclaimed and aborted
+     — do not claim a second bead (a verified post-claim epic or milestone
+     is unclaimed and the next candidate may be tried). Resume requires the
+     freshly shown status to still be in_progress. A ready or in-progress
+     record missing a string id is a hard failure, not an empty queue —
+     validate every ready record's id before filtering grouping types. A non-string
+     issue_type (including boolean false) or a missing/non-string status is
+     a parse failure; select type fields by presence, not `//`. Show/claim
+     may wrap the record in `.issue`; read id and status from the record or
+     that wrapper. A ready `{issue: {...}}` wrapper is kept as the outer
+     object so a top-level id/status/type remains authoritative even when
+     invalid (presence, not `.id` truthiness). Validate each ready record's
+     type before the grouping-type filter (empty type still goes to bd show).
+     A structured bd show error object is a parse failure, not an unknown
+     type. Empty `bd --json` output is a parse failure, not QUEUE_EMPTY.
+     Resume parses status before skipping epic/milestone/unknown. Parse failure of
+     `bd list --flat` is not hidden by the non-flat fallback. A jq
+     validation failure of the in-progress list (non-array payload or
+     missing string id) is return 2, not a command failure that retries
+     non-flat. The post-run summary ready count is informational and does
+     not change the cycle exit code.
+  2. Ask Grok to implement (or continue) it, open a PR, and request Copilot
+  3. Poll Copilot; if it leaves comments, ask Grok to fix and re-request
+  4. Repeat until Copilot is green or the round cap is hit
+  5. Merge if allowed and close the bead (not the parent epic, unless --drain)
+
+--drain <epic-id> keeps going until that epic has no ready descendants, then
+closes the epic if and only if:
+  - every descendant is closed (not only direct children; also
+    bd epic status eligible_for_close)
+  - the epic has at least one child
+Optional extra gates from .beads/cycle.conf (or beads/cycle.conf), if set:
+  - mapped close-out child from origin/<default-branch>:<id-map> is a
+    descendant and is closed (do not infer by title; do not use a local
+    or stale working-copy map; the epic key must map to this epic id)
+  - write-up glob on origin/<default-branch> (required headings if configured)
+  - changeset glob on origin/<default-branch> (not README)
+Otherwise the epic stays open. Does not call bd epic close-eligible
+(that would close every eligible epic).
+
+Options:
+  --drain              Run remaining children of the given epic, then maybe close it
+  --max-beads N        Drain safety cap (default 40)
+  --max-rounds N       Copilot fix/re-review cycles (default 5)
+  --max-turns N        Per Grok invocation (default 80)
+  --poll-seconds N     Copilot/CI poll interval (default 15)
+  --review-timeout N   Seconds to wait for a Copilot review (default 600)
+  --ci-timeout N       Seconds to wait for CI before merge (default 1200)
+  --no-worktree        Run Grok in this checkout instead of a git worktree
+  --no-merge           Stop after Copilot is green; do not merge or close
+  --dry-run            Print the selected bead and prompts; make no writes
+  -h, --help           Show this help
+
+Config (optional KEY=VALUE file; env BEAD_CYCLE_* wins; CLI wins over both):
+  .beads/cycle.conf (preferred) or beads/cycle.conf
+  BEAD_CYCLE_REVIEWER              Copilot reviewer login
+  BEAD_CYCLE_BRANCH_PREFIX         Branch prefix (default feat/)
+  BEAD_CYCLE_MERGE_METHODS         Comma list: squash,merge,rebase
+  BEAD_CYCLE_DRAIN_ID_MAP          Origin path to JSON id map (empty = skip)
+  BEAD_CYCLE_DRAIN_ID_MAP_EPIC_KEY Template e{n}  ({n} unpadded, {nn} 2-digit)
+  BEAD_CYCLE_DRAIN_ID_MAP_CLOSE_KEY Template e{n}-close
+  BEAD_CYCLE_DRAIN_WRITEUP_GLOB    Origin glob, e.g. docs/epics/E{nn}-*.md
+  BEAD_CYCLE_DRAIN_WRITEUP_HEADINGS Comma list of required heading prefixes
+  BEAD_CYCLE_DRAIN_WRITEUP_N_MIN   Inclusive epic-number floor (empty = none)
+  BEAD_CYCLE_DRAIN_WRITEUP_N_MAX   Inclusive epic-number ceiling (empty = none)
+  BEAD_CYCLE_DRAIN_CHANGESET_GLOB  Origin glob, e.g. .changeset/*.md
+
+Requires: bd, gh (authenticated), jq, git, grok.
+
+Exit codes:
+  0  success, bead already closed, or drain finished (epic closed or
+     remaining children not ready)
+  1  hard failure (unknown type, unclaim failure, bd/parse errors), or
+     drain: all children closed but close-out artifacts missing
+  2  round cap reached with leftover Copilot comments
+  3  QUEUE_EMPTY (no implementable non-epic/non-milestone ready item in
+     scope; not used for --drain)
+
+Examples:
+  ./scripts/bead-cycle                 # next global ready (skips epics)
+  ./scripts/bead-cycle <bead-id>       # that bead
+  ./scripts/bead-cycle <epic-id>       # next ready child of that epic
+  ./scripts/bead-cycle --drain <epic-id>   # remaining children, then close iff eligible
+
+Drain one-by-one (no epic close):
+  while ./scripts/bead-cycle; do :; done
+  # stops on QUEUE_EMPTY (3), hard failure (1), or round cap (2)
+  while ./scripts/bead-cycle <epic-id>; do :; done
+EOF
+}
+
+die() {
+  printf 'error: %s\n' "$*" | tee_drain_log >&2 || true
+  exit 1
+}
+
+# When DRAIN_LOG is set, also append so unattended drain recovery has
+# selection, close, and failure details (not only the banner). Skip the
+# file on --dry-run so inspection cannot create or mutate a log.
+tee_drain_log() {
+  if [[ "${DRY_RUN:-0}" -eq 0 && -n "${DRAIN_LOG:-}" ]]; then
+    tee -a "$DRAIN_LOG"
+  else
+    cat
+  fi
+}
+
+# stderr: wait_for_copilot_review prints review JSON on stdout, and the
+# nurse loop captures that with $().
+log() {
+  printf '%s\n' "$*" | tee_drain_log >&2
+}
+
+need_cmd() {
+  command -v "$1" >/dev/null 2>&1 || die "missing required command: $1"
+}
+
+is_int() {
+  [[ "${1:-}" =~ ^[0-9]+$ ]]
+}
+
+# Strip leading zeros so Bash 3.2 arithmetic and printf %d treat 08/09 as
+# decimal 8/9, not invalid octal (E08/E09 title fallbacks).
+decimal_int() {
+  local n=$1
+  [[ "$n" =~ ^[0-9]+$ ]] || return 1
+  printf '%d' "$((10#$n))"
+}
+
+is_grouping_type() {
+  case "${1:-}" in
+    epic|milestone) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+now_stamp() {
+  date '+%Y-%m-%dT%H:%M:%S%z'
+}
+
+# True if variable $1 is set (including empty). Bash 3.2: no namerefs.
+is_var_set() {
+  eval "[[ -n \"\${$1+x}\" ]]"
+}
+
+# KEY=VALUE only. No source, no expansion. Skip keys already in the
+# environment so BEAD_CYCLE_* env wins over the file.
+load_cycle_conf_file() {
+  local file=$1
+  local line key val
+  [[ -f "$file" ]] || return 0
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line=${line%$'\r'}
+    case "$line" in
+      ''|\#*) continue ;;
+    esac
+    if [[ "$line" =~ ^([A-Za-z_][A-Za-z0-9_]*)=(.*)$ ]]; then
+      key=${BASH_REMATCH[1]}
+      val=${BASH_REMATCH[2]}
+    else
+      die "invalid cycle.conf line in ${file}: ${line}"
+    fi
+    case "$key" in
+      BEAD_CYCLE_*) ;;
+      *) continue ;;
+    esac
+    if [[ "$val" == \"*\" ]]; then
+      val=${val#\"}
+      val=${val%\"}
+    elif [[ "$val" == \'*\' ]]; then
+      val=${val#\'}
+      val=${val%\'}
+    fi
+    if is_var_set "$key"; then
+      continue
+    fi
+    printf -v "$key" '%s' "$val"
+  done < "$file"
+}
+
+load_cycle_conf() {
+  local file=""
+  if [[ -n "$REPO_ROOT" && -f "$REPO_ROOT/.beads/cycle.conf" ]]; then
+    file="$REPO_ROOT/.beads/cycle.conf"
+  elif [[ -n "$REPO_ROOT" && -f "$REPO_ROOT/beads/cycle.conf" ]]; then
+    file="$REPO_ROOT/beads/cycle.conf"
+  fi
+  [[ -n "$file" ]] || return 0
+  load_cycle_conf_file "$file"
+}
+
+resolve_repo_root() {
+  local dir
+  dir=$(git -C "$SCRIPT_DIR" rev-parse --show-toplevel 2>/dev/null) && {
+    printf '%s\n' "$dir"
+    return 0
+  }
+  dir=$(git rev-parse --show-toplevel 2>/dev/null) && {
+    printf '%s\n' "$dir"
+    return 0
+  }
+  return 1
+}
+
+# {nn} is 2-digit (10 -> 10, 1 -> 01); {n} is unpadded. Replace {nn} first.
+# ${var//pat/repl} is glob, not regex: quote the braces so they are literal.
+expand_n_tokens() {
+  local template=$1
+  local n=$2
+  local nn out
+  nn=$(printf '%02d' "$n")
+  out=$template
+  out=${out//'{nn}'/$nn}
+  out=${out//'{n}'/$n}
+  printf '%s' "$out"
+}
+
+# Repo-relative glob -> full-path regex. * is one path component ([^/]+).
+glob_to_path_regex() {
+  local glob=$1
+  local i=0 len=${#glob} c out=""
+  while (( i < len )); do
+    c=${glob:i:1}
+    case "$c" in
+      '*') out="${out}[^/]+" ;;
+      '.'|'['|']'|'^'|'$'|'\\'|'|'|'+'|'('|')'|'{'|'}'|'?') out="${out}\\${c}" ;;
+      *) out="${out}${c}" ;;
+    esac
+    i=$((i + 1))
+  done
+  printf '^%s$' "$out"
+}
+
+regex_escape() {
+  local s=$1
+  local i=0 len=${#s} c out=""
+  while (( i < len )); do
+    c=${s:i:1}
+    case "$c" in
+      '.'|'['|']'|'^'|'$'|'\\'|'|'|'*'|'+'|'('|')'|'{'|'}'|'?') out="${out}\\${c}" ;;
+      *) out="${out}${c}" ;;
+    esac
+    i=$((i + 1))
+  done
+  printf '%s' "$out"
+}
+
+trim_ws() {
+  local s=$1
+  s=${s#"${s%%[![:space:]]*}"}
+  s=${s%"${s##*[![:space:]]}"}
+  printf '%s' "$s"
+}
+
+cycle_mktemp() {
+  local suffix=$1
+  if [[ -n "$REPO_ROOT" && -d "$REPO_ROOT/.beads" ]]; then
+    mktemp "$REPO_ROOT/.beads/${suffix}.XXXXXX"
+  else
+    mktemp "${TMPDIR:-/tmp}/${suffix}.XXXXXX"
+  fi
+}
+
+cycle_log_path() {
+  local id=$1
+  if [[ -n "$REPO_ROOT" && -d "$REPO_ROOT/.beads" ]]; then
+    printf '%s\n' "$REPO_ROOT/.beads/bead-cycle-${id}.log"
+  else
+    printf '%s\n' "${TMPDIR:-/tmp}/bead-cycle-${id}.log"
+  fi
+}
+
+if REPO_ROOT=$(resolve_repo_root); then
+  cd "$REPO_ROOT"
+  load_cycle_conf
+else
+  REPO_ROOT=""
+fi
+
+MAX_ROUNDS="${BEAD_CYCLE_MAX_ROUNDS:-5}"
+MAX_TURNS="${BEAD_CYCLE_MAX_TURNS:-80}"
+POLL_SECONDS="${BEAD_CYCLE_POLL_SECONDS:-15}"
+REVIEW_TIMEOUT="${BEAD_CYCLE_REVIEW_TIMEOUT:-600}"
+CI_TIMEOUT="${BEAD_CYCLE_CI_TIMEOUT:-1200}"
+MAX_BEADS="${BEAD_CYCLE_MAX_BEADS:-40}"
+COPILOT_REVIEWER="${BEAD_CYCLE_REVIEWER:-copilot-pull-request-reviewer[bot]}"
+BRANCH_PREFIX="${BEAD_CYCLE_BRANCH_PREFIX:-feat/}"
+MERGE_METHODS="${BEAD_CYCLE_MERGE_METHODS:-squash,merge}"
+DRAIN_ID_MAP="${BEAD_CYCLE_DRAIN_ID_MAP:-}"
+# Defaults contain '}' — cannot use ${var:-e{n}} (the brace closes the expansion).
+DRAIN_ID_MAP_EPIC_KEY="${BEAD_CYCLE_DRAIN_ID_MAP_EPIC_KEY-}"
+if [[ -z "$DRAIN_ID_MAP_EPIC_KEY" ]]; then
+  DRAIN_ID_MAP_EPIC_KEY='e{n}'
+fi
+DRAIN_ID_MAP_CLOSE_KEY="${BEAD_CYCLE_DRAIN_ID_MAP_CLOSE_KEY-}"
+if [[ -z "$DRAIN_ID_MAP_CLOSE_KEY" ]]; then
+  DRAIN_ID_MAP_CLOSE_KEY='e{n}-close'
+fi
+DRAIN_WRITEUP_GLOB="${BEAD_CYCLE_DRAIN_WRITEUP_GLOB:-}"
+DRAIN_WRITEUP_HEADINGS="${BEAD_CYCLE_DRAIN_WRITEUP_HEADINGS:-}"
+DRAIN_WRITEUP_N_MIN="${BEAD_CYCLE_DRAIN_WRITEUP_N_MIN:-}"
+DRAIN_WRITEUP_N_MAX="${BEAD_CYCLE_DRAIN_WRITEUP_N_MAX:-}"
+DRAIN_CHANGESET_GLOB="${BEAD_CYCLE_DRAIN_CHANGESET_GLOB:-}"
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    --max-rounds)
+      is_int "${2:-}" || die "--max-rounds requires an integer"
+      MAX_ROUNDS=$2
+      shift 2
+      ;;
+    --max-turns)
+      is_int "${2:-}" || die "--max-turns requires an integer"
+      MAX_TURNS=$2
+      shift 2
+      ;;
+    --poll-seconds)
+      is_int "${2:-}" || die "--poll-seconds requires an integer"
+      POLL_SECONDS=$2
+      shift 2
+      ;;
+    --review-timeout)
+      is_int "${2:-}" || die "--review-timeout requires an integer"
+      REVIEW_TIMEOUT=$2
+      shift 2
+      ;;
+    --ci-timeout)
+      is_int "${2:-}" || die "--ci-timeout requires an integer"
+      CI_TIMEOUT=$2
+      shift 2
+      ;;
+    --drain)
+      DRAIN=1
+      shift
+      ;;
+    --max-beads)
+      is_int "${2:-}" || die "--max-beads requires an integer"
+      MAX_BEADS=$(decimal_int "$2") || die "--max-beads requires an integer"
+      (( MAX_BEADS >= 1 )) || die "--max-beads must be >= 1"
+      shift 2
+      ;;
+    --no-worktree)
+      USE_WORKTREE=0
+      shift
+      ;;
+    --no-merge)
+      DO_MERGE=0
+      shift
+      ;;
+    --dry-run)
+      DRY_RUN=1
+      shift
+      ;;
+    --)
+      shift
+      break
+      ;;
+    -*)
+      die "unknown option: $1"
+      ;;
+    *)
+      if [[ -n "$BEAD_ID" ]]; then
+        die "unexpected extra argument: $1"
+      fi
+      BEAD_ID=$1
+      shift
+      ;;
+  esac
+done
+
+[[ $# -eq 0 ]] || die "unexpected extra argument: $1"
+
+if [[ -z "$REPO_ROOT" ]]; then
+  die "not inside a git repository"
+fi
+cd "$REPO_ROOT"
+
+if [[ -n "$BRANCH_PREFIX" && "$BRANCH_PREFIX" != */ ]]; then
+  BRANCH_PREFIX="${BRANCH_PREFIX}/"
+fi
+
+# Env and --max-beads both go through arithmetic later (`(( completed <
+# MAX_BEADS ))`). Normalize so 08/09 are decimal, not invalid octal.
+if ! MAX_BEADS=$(decimal_int "$MAX_BEADS"); then
+  die "--max-beads / BEAD_CYCLE_MAX_BEADS must be an integer"
+fi
+(( MAX_BEADS >= 1 )) || die "--max-beads must be >= 1"
+
+if [[ -n "$DRAIN_WRITEUP_N_MIN" ]]; then
+  DRAIN_WRITEUP_N_MIN=$(decimal_int "$DRAIN_WRITEUP_N_MIN") \
+    || die "BEAD_CYCLE_DRAIN_WRITEUP_N_MIN must be an integer"
+fi
+if [[ -n "$DRAIN_WRITEUP_N_MAX" ]]; then
+  DRAIN_WRITEUP_N_MAX=$(decimal_int "$DRAIN_WRITEUP_N_MAX") \
+    || die "BEAD_CYCLE_DRAIN_WRITEUP_N_MAX must be an integer"
+fi
+
+# Unwrap BD_JSON_ENVELOPE=1 ({data, schema_version}) to the legacy payload.
+# Safe to apply to already-unwrapped JSON. ready_issues accepts a top-level
+# array or an object with .issues (or a single issue object with .id, or
+# a wrapped {issue: {...}}). Single-object and wrapped records are kept as
+# the outer object (presence of `id` or `.issue`, not truthiness) so
+# top-level fields stay authoritative. Id and status may live on the
+# record or under `.issue` (same wrapping as issue_type_field /
+# bead_id_from_json).
+jq_bd_preamble='
+  def unwrap:
+    if type == "object" and has("data") and has("schema_version") then .data
+    else . end;
+
+  def reject_error($ctx):
+    if type == "object" and .error then error($ctx + ": " + (.error | tostring))
+    else . end;
+
+  # Non-empty string on the record or a wrapped `.issue` object (legacy
+  # single-object show/claim). Presence, not `//`: boolean false / [] / {}
+  # are parse failures. Top-level wins even when invalid (do not fall
+  # through to `.issue`).
+  def require_string_field($key; $ctx):
+    (if has($key) then {found: true, value: .[$key]}
+     elif (.issue | type) == "object" and (.issue | has($key)) then
+       {found: true, value: .issue[$key]}
+     else {found: false, value: null} end) as $pick
+    | if $pick.found == false then error($ctx + ": issue missing " + $key)
+      elif ($pick.value | type) == "string" and ($pick.value | length) > 0 then $pick.value
+      else error($ctx + ": issue missing " + $key) end;
+
+  def require_id($ctx): require_string_field("id"; $ctx);
+  def require_status($ctx): require_string_field("status"; $ctx);
+
+  # Optional string on the record or `.issue`. Missing/non-string → "".
+  # Top-level wins even when invalid (do not fall through to `.issue`).
+  def optional_string_field($key):
+    (if has($key) then {found: true, value: .[$key]}
+     elif (.issue | type) == "object" and (.issue | has($key)) then
+       {found: true, value: .issue[$key]}
+     else {found: false, value: null} end) as $pick
+    | if $pick.found == false then ""
+      elif ($pick.value | type) == "string" then $pick.value
+      else "" end;
+
+  # Missing/null parent = root (empty). Empty string / wrong type = error.
+  # Top-level wins even when invalid. Parent may be a string id or {id: ...}.
+  def parent_id($ctx):
+    (if has("parent") then {found: true, value: .parent}
+     elif (.issue | type) == "object" and (.issue | has("parent")) then
+       {found: true, value: .issue.parent}
+     else {found: false, value: null} end) as $pick
+    | if $pick.found == false or $pick.value == null then empty
+      elif ($pick.value | type) == "string" then
+        if ($pick.value | length) > 0 then $pick.value
+        else error($ctx + ": empty parent") end
+      elif ($pick.value | type) == "object" then
+        if (($pick.value.id | type) == "string") and (($pick.value.id | length) > 0)
+        then $pick.value.id
+        else error($ctx + ": malformed parent") end
+      else error($ctx + ": malformed parent") end;
+
+  # Presence, not `//`: boolean false / [] / {} are non-string parse
+  # failures. Missing keys stay "" (unknown-type skip on auto-claim).
+  def issue_type_field:
+    (if has("issue_type") then {found: true, value: .issue_type}
+     elif has("type") then {found: true, value: .type}
+     elif (.issue | type) == "object" and (.issue | has("issue_type")) then
+       {found: true, value: .issue.issue_type}
+     elif (.issue | type) == "object" and (.issue | has("type")) then
+       {found: true, value: .issue.type}
+     else {found: false, value: null} end) as $pick
+    | if $pick.found == false then ""
+      elif ($pick.value | type) == "string" then $pick.value
+      else error("bd show: issue_type is not a string") end;
+
+  # Names from `bd types --json` (core plus configured custom types).
+  # Presence, not `//`: a non-array core_types/custom_types is a parse failure.
+  # `core_types` is required and must be a non-empty array: missing/empty
+  # would make built-in types look unknown instead of failing closed.
+  def known_issue_type_names:
+    def type_entry_name:
+      if type == "object" then
+        if (.name | type) == "string" and (.name | length) > 0 then .name
+        else error("bd types: type name is not a string") end
+      elif type == "string" and length > 0 then .
+      else error("bd types: unexpected type entry") end;
+    def names_from($key):
+      if has($key) then
+        if (.[$key] | type) != "array" then error("bd types: \($key) is not an array")
+        else .[$key][] | type_entry_name end
+      else empty end;
+    unwrap
+    | reject_error("bd types")
+    | if type != "object" then error("bd types: expected object")
+      elif (has("core_types") | not) then error("bd types: missing core_types")
+      elif (.core_types | type) != "array" then error("bd types: core_types is not an array")
+      elif (.core_types | length) == 0 then error("bd types: core_types is empty")
+      else [names_from("core_types"), names_from("custom_types"), names_from("additional_types")]
+           | unique[]
+      end;
+
+  def ready_issues:
+    unwrap
+    | if . == null then error("bd ready: null JSON")
+      elif type == "array" then .
+      elif type == "object" then
+        if .error then error("bd ready: \(.error)")
+        elif (.issues | type) == "array" then .issues
+        elif has("id") or ((.issue | type) == "object") then [.]
+        else error("bd ready: unexpected JSON object") end
+      else error("bd ready: expected JSON array") end;
+'
+
+json_field() {
+  # Usage: json_field JSON PATH
+  # PATH is a jq expression that should print a raw value (or "null").
+  local json=$1
+  local path=$2
+  printf '%s' "$json" | jq -er "$path" 2>/dev/null || true
+}
+
+bead_id_from_json() {
+  local json=$1
+  printf '%s' "$json" | jq -r "${jq_bd_preamble}"'
+    unwrap
+    | if . == null then empty
+      elif type == "array" then
+        if length == 0 then empty else (.[0].id // empty) end
+      elif type == "object" then
+        if .error then error("bd json: \(.error)")
+        else (.id // .issue.id // empty) end
+      else error("bd json: expected object or array") end
+  '
+}
+
+# Implementation beads only. Parent-child grouping does not hide epics or
+# milestones from `bd ready`; never auto-claim those grouping types.
+# Fail closed on malformed JSON, any ready record with no string id
+# (including an epic), or a non-string issue_type (including false).
+# Validate id and type first, then filter grouping types — do not look
+# like an empty queue. Empty type is kept so bd show can apply the
+# unknown-type skip policy.
+non_epic_ids_from_ready() {
+  printf '%s' "$1" | jq -r "${jq_bd_preamble}"'
+    ready_issues
+    | .[]
+    | require_id("bd ready") as $id
+    | issue_type_field as $t
+    | select($t != "epic" and $t != "milestone")
+    | $id
+  '
+}
+
+fetch_ready_json() {
+  if [[ -n "$SCOPE_ID" ]]; then
+    bd_json ready -n 0 --parent "$SCOPE_ID"
+  else
+    bd_json ready -n 0
+  fi
+}
+
+# Count every ready issue (including epics). Same shapes as ready_issues.
+ready_count_from_json() {
+  printf '%s' "$1" | jq -r "${jq_bd_preamble}"'
+    ready_issues | length
+  '
+}
+
+bead_status_from_json() {
+  local json=$1
+  printf '%s' "$json" | jq -r "${jq_bd_preamble}"'
+    unwrap
+    | if type == "array" then
+        if length == 0 then error("bd show: empty array")
+        else (.[0] | reject_error("bd show") | require_status("bd show")) end
+      elif type == "object" then reject_error("bd show") | require_status("bd show")
+      else error("bd show: expected JSON object or array") end
+  '
+}
+
+bead_type_from_json() {
+  local json=$1
+  printf '%s' "$json" | jq -r "${jq_bd_preamble}"'
+    unwrap
+    | if type == "array" then
+        if length == 0 then error("bd show: empty array")
+        else (.[0] | reject_error("bd show") | issue_type_field) end
+      elif type == "object" then reject_error("bd show") | issue_type_field
+      else error("bd show: expected JSON object or array") end
+  '
+}
+
+# Allowlist from `bd types --json`. Empty/missing string stays unknown
+# (skip-on-auto / die-on-explicit). A string not in this set (`wat`) is
+# the same unknown policy — not an implementable type.
+# Indexed array + exact match: `declare -A` needs Bash 4+, stock macOS is 3.2.
+KNOWN_ISSUE_TYPES_LOADED=0
+KNOWN_ISSUE_TYPES=()
+
+load_known_issue_types() {
+  if [[ "$KNOWN_ISSUE_TYPES_LOADED" -eq 1 ]]; then
+    return 0
+  fi
+  local json names name
+  json=$(bd_json types) || die "failed to list valid issue types (bd types)"
+  if ! names=$(printf '%s' "$json" | jq -r "${jq_bd_preamble} known_issue_type_names"); then
+    die "failed to parse bd types JSON"
+  fi
+  KNOWN_ISSUE_TYPES=()
+  while IFS= read -r name; do
+    [[ -n "$name" ]] || continue
+    KNOWN_ISSUE_TYPES+=("$name")
+  done <<< "$names"
+  if [[ ${#KNOWN_ISSUE_TYPES[@]} -eq 0 ]]; then
+    die "bd types returned no type names"
+  fi
+  KNOWN_ISSUE_TYPES_LOADED=1
+}
+
+is_known_issue_type() {
+  local t=$1 name
+  # 0 = known, 1 = unknown (skip), 2 = allowlist unavailable.
+  # Callers that `continue` on nonzero must treat 2 as a hard error;
+  # otherwise a `bd types` failure looks like "no implementable work."
+  load_known_issue_types || return 2
+  [[ -n "$t" ]] || return 1
+  for name in "${KNOWN_ISSUE_TYPES[@]}"; do
+    [[ "$name" == "$t" ]] && return 0
+  done
+  return 1
+}
+
+queue_empty() {
+  if [[ -n "$SCOPE_ID" ]]; then
+    log "QUEUE_EMPTY (no ready children of ${SCOPE_ID})"
+  fi
+  echo "QUEUE_EMPTY"
+  exit 3
+}
+
+# Drain uses return 3 as an internal "no ready children" sentinel.
+# Do not print QUEUE_EMPTY: drain_epic catches 3, evaluates close-out,
+# and may exit 0 while descendants are still open / not ready. Wrappers
+# that inspect stdout for QUEUE_EMPTY must not see the global sentinel.
+maybe_queue_empty() {
+  if [[ "$DRAIN" -eq 1 ]]; then
+    if [[ -n "$SCOPE_ID" ]]; then
+      log "no ready children of ${SCOPE_ID}"
+    else
+      log "no ready children"
+    fi
+    return 3
+  fi
+  queue_empty
+}
+
+# Release a bead we claimed then refused. Fail the cycle if it stays in_progress.
+unclaim_refused() {
+  local id=$1
+  local err show status
+  if ! err=$(bd_json unclaim "$id" --reason "bead-cycle refused non-implementable issue" 2>&1); then
+    die "failed to unclaim refused bead ${id}: ${err}"
+  fi
+  show=$(bd_json show "$id") || die "failed to verify unclaim of ${id}"
+  if ! status=$(bead_status_from_json "$show"); then
+    die "failed to parse status after unclaim of ${id}"
+  fi
+  if [[ -z "$status" || "$status" == "in_progress" ]]; then
+    die "unclaim of refused bead ${id} left it unverified (status=${status:-unknown})"
+  fi
+}
+
+# Fail closed: missing type is not implementable. Used for explicit BEAD_ID.
+refuse_if_not_implementable() {
+  local id=$1
+  local json=$2
+  local itype
+  if ! itype=$(bead_type_from_json "$json"); then
+    die "cannot parse issue_type for ${id}; refusing to claim (fail closed)"
+  fi
+  if [[ -z "$itype" ]]; then
+    die "cannot determine issue_type for ${id}; refusing to claim (fail closed)"
+  fi
+  if is_grouping_type "$itype"; then
+    die "refusing to implement ${itype} ${id} (grouping only; implement children)"
+  fi
+  if ! is_known_issue_type "$itype"; then
+    die "refusing to implement ${id} with unknown issue_type ${itype} (not in bd types)"
+  fi
+}
+
+unwrap_bd_json() {
+  # Blank `bd --json` output is a parse failure (jq without -e treats
+  # empty input as success). jq -e also fails on a last value of false/null.
+  if [[ -z "${1:-}" ]]; then
+    return 2
+  fi
+  printf '%s' "$1" | jq -e -c "${jq_bd_preamble} unwrap"
+}
+
+bd_json() {
+  local raw
+  # Return 1 for a `bd` command failure, 2 for a response-parse failure, so
+  # callers can unclaim after a successful write whose JSON is unusable.
+  if ! raw=$(bd "$@" --json --quiet --no-color); then
+    return 1
+  fi
+  unwrap_bd_json "$raw" || return 2
+}
+
+# Confirm a mutation actually left $id at $expected.
+# bd_json rc 0 only means unwrap succeeded — it does not reject a
+# structured {error:...} payload — so do not treat that as success.
+# Accept the write JSON only when it has no error and status matches;
+# otherwise re-read `bd show`. Returns 0 on confirmed status, 1 on
+# command failure, 2 when status could not be confirmed.
+bd_write_confirm_status() {
+  local expected=$1
+  local id=$2
+  local write_rc=0 show st write_json write_st
+  shift 2
+  # Do not toggle set -e here: a later `return 1` with errexit on would
+  # abort a caller that used `set +e; fn; rc=$?`.
+  write_json=$(bd_json "$@") || write_rc=$?
+  if [[ "$write_rc" -eq 1 ]]; then
+    return 1
+  fi
+  if [[ "$write_rc" -eq 0 ]]; then
+    if write_st=$(printf '%s' "$write_json" | jq -r "${jq_bd_preamble}"'
+      unwrap
+      | reject_error("bd write")
+      | require_status("bd write")
+    '); then
+      if [[ "$write_st" == "$expected" ]]; then
+        return 0
+      fi
+    fi
+  fi
+  if ! show=$(bd_json show "$id"); then
+    return 2
+  fi
+  if ! st=$(bead_status_from_json "$show"); then
+    return 2
+  fi
+  if [[ "$st" == "$expected" ]]; then
+    return 0
+  fi
+  return 2
+}
+
+# Claim id. Sets CLAIM_JSON and BEAD_STATUS. Returns 1 if `bd update --claim`
+# itself failed (caller may try the next candidate). A successful claim whose
+# JSON cannot be parsed, or whose status is missing/non-string/not
+# in_progress, is unclaimed and aborts the cycle — never claim a second bead.
+claim_bead() {
+  local id=$1
+  local raw rc=0 claimed_status
+  set +e
+  raw=$(bd update "$id" --claim --json --quiet --no-color)
+  rc=$?
+  set -e
+  if [[ "$rc" -ne 0 ]]; then
+    return 1
+  fi
+  if ! CLAIM_JSON=$(unwrap_bd_json "$raw"); then
+    unclaim_refused "$id"
+    die "claimed ${id} but claim JSON was unparseable; unclaimed. not claiming another bead"
+  fi
+  if ! claimed_status=$(bead_status_from_json "$CLAIM_JSON"); then
+    unclaim_refused "$id"
+    die "claimed ${id} but claim status was unparseable; unclaimed. not claiming another bead"
+  fi
+  if [[ "$claimed_status" != "in_progress" ]]; then
+    unclaim_refused "$id"
+    die "claimed ${id} but status was ${claimed_status:-unknown} (expected in_progress); unclaimed. not claiming another bead"
+  fi
+  BEAD_STATUS=$claimed_status
+  return 0
+}
+
+preflight() {
+  need_cmd grok
+  need_cmd bd
+  need_cmd gh
+  need_cmd jq
+  need_cmd git
+  git rev-parse --is-inside-work-tree >/dev/null 2>&1 || die "not a git repository"
+  if ! gh auth status >/dev/null 2>&1; then
+    die "gh is not authenticated (run gh auth login)"
+  fi
+}
+
+OWNER_REPO=""
+OWNER=""
+REPO=""
+DEFAULT_BRANCH="main"
+
+load_repo_info() {
+  local info
+  info=$(gh repo view --json nameWithOwner,defaultBranchRef)
+  OWNER_REPO=$(printf '%s' "$info" | jq -r '.nameWithOwner')
+  OWNER=${OWNER_REPO%%/*}
+  REPO=${OWNER_REPO#*/}
+  DEFAULT_BRANCH=$(printf '%s' "$info" | jq -r '.defaultBranchRef.name // "main"')
+}
+
+normalize_pr_state() {
+  local state=${1:-}
+  local merged=${2:-}
+  case "$state" in
+    OPEN|open) echo open ;;
+    MERGED|merged) echo merged ;;
+    CLOSED|closed)
+      if [[ "$merged" != "null" && -n "$merged" ]]; then
+        echo merged
+      else
+        echo closed
+      fi
+      ;;
+    *)
+      if [[ "$merged" != "null" && -n "$merged" ]]; then
+        echo merged
+      else
+        echo none
+      fi
+      ;;
+  esac
+}
+
+discover_pr() {
+  local id=$1
+  local result_json=${2:-}
+  local number url state merged info match
+
+  if [[ -n "$result_json" ]]; then
+    number=$(json_field "$result_json" '.pr_number // empty')
+    url=$(json_field "$result_json" '.pr_url // empty')
+    if [[ "$number" =~ ^[0-9]+$ ]]; then
+      info=$(gh pr view "$number" --json url,state,mergedAt 2>/dev/null || true)
+      if [[ -n "$info" ]]; then
+        url=$(printf '%s' "$info" | jq -r '.url // empty')
+        state=$(normalize_pr_state \
+          "$(printf '%s' "$info" | jq -r '.state // empty')" \
+          "$(printf '%s' "$info" | jq -r '.mergedAt // empty')")
+        if [[ -n "$url" && "$state" != "none" ]]; then
+          printf '%s\t%s\t%s\n' "$number" "$state" "$url"
+          return 0
+        fi
+      elif [[ -n "$url" && "$url" != "null" ]]; then
+        printf '%s\t%s\t%s\n' "$number" "open" "$url"
+        return 0
+      fi
+    fi
+  fi
+
+  local prs
+  prs=$(gh pr list --state all --limit 80 --json number,url,headRefName,title,state,mergedAt)
+  match=$(printf '%s' "$prs" | jq -c --arg id "$id" --arg prefix "$BRANCH_PREFIX" '
+    def re_quote: gsub("(?<c>[\\\\.^$|?*+()\\[\\]{}])"; "\\\(.c)");
+    def matches:
+      (.headRefName | test("^" + ($prefix | re_quote) + ($id | re_quote) + "(-|$)"))
+      or (
+        (.title | test("(^|[^A-Za-z0-9-])" + ($id | re_quote) + "([^A-Za-z0-9-]|$)"))
+        and ((.headRefName | test("^" + ($prefix | re_quote))) | not)
+      );
+    [.[] | select(matches)]
+    | sort_by(
+        if .state == "OPEN" then 0
+        elif .mergedAt != null then 1
+        else 2 end
+      )
+    | first // empty
+  ')
+  if [[ -n "$match" ]]; then
+    number=$(printf '%s' "$match" | jq -r '.number')
+    url=$(printf '%s' "$match" | jq -r '.url')
+    state=$(normalize_pr_state \
+      "$(printf '%s' "$match" | jq -r '.state // empty')" \
+      "$(printf '%s' "$match" | jq -r '.mergedAt // empty')")
+    printf '%s\t%s\t%s\n' "$number" "$state" "$url"
+    return 0
+  fi
+
+  return 1
+}
+
+# Literal prefix match: quote the bead id so glob metacharacters (and '.' in
+# child ids like gitdown-kee.1) cannot overmatch feat/gitdown-keeX1-*.
+feat_ref_matches_id() {
+  local short=$1
+  local id=$2
+  [[ "$short" == "${BRANCH_PREFIX}${id}" || "$short" == "${BRANCH_PREFIX}${id}-"* ]]
+}
+
+worktree_matches_id() {
+  local path=$1
+  local branch_short=$2
+  local id=$3
+  local base
+  base=$(basename "$path")
+  [[ "$base" == "bead-${id}" || "$base" == "bead-${id}-"* || \
+     "$path" == *"/bead-${id}" || "$path" == *"/bead-${id}-"* ]] \
+    || feat_ref_matches_id "$branch_short" "$id"
+}
+
+feat_branch_for_id() {
+  local id=$1
+  local ref short
+  while IFS= read -r ref; do
+    [[ -n "$ref" ]] || continue
+    short=${ref#origin/}
+    if feat_ref_matches_id "$short" "$id"; then
+      printf '%s\n' "$short"
+      return 0
+    fi
+  done < <(git for-each-ref --format='%(refname:short)' refs/heads refs/remotes/origin)
+  return 1
+}
+
+worktree_for_id() {
+  local id=$1
+  local path="" branch=""
+  local line short
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    case "$line" in
+      worktree\ *)
+        path=${line#worktree }
+        ;;
+      branch\ *)
+        branch=${line#branch }
+        ;;
+      "")
+        if [[ -n "$path" ]]; then
+          short=${branch#refs/heads/}
+          if worktree_matches_id "$path" "$short" "$id"; then
+            printf '%s\n' "$path"
+            return 0
+          fi
+        fi
+        path=""
+        branch=""
+        ;;
+    esac
+  done < <(git worktree list --porcelain; printf '\n')
+  return 1
+}
+
+# Print every in-progress id (bd list -n 0 = unlimited; default is 50).
+# Fail the caller if both list forms fail or the payload is not a JSON array
+# so resume cannot fall through to claiming a new bead.
+# bd_json returns 1 for a command failure and 2 for a parse failure: only
+# fall back from --flat on command failure; a malformed --flat payload
+# must not be hidden by a successful non-flat list.
+# The id/array jq below is also a parse step: jq's native nonzero (typically
+# 1 or 5) would look like a command failure at the --flat fallback. Normalize
+# any validation failure to 2 before returning.
+# bd list --parent / bd children are direct children only; bd ready --parent
+# is descendants. When scoped, walk children recursively so an in-progress
+# grandchild is resumed (and close-out cannot ignore it).
+in_progress_ids() {
+  local parent=${1:-}
+  local json rc=0 ids jq_rc=0
+  if [[ -n "$parent" ]]; then
+    descendants_json "$parent" || return $?
+    json=$DESCENDANTS_JSON
+    set +e
+    ids=$(printf '%s' "$json" | jq -r "${jq_bd_preamble}"'
+      if type != "array" then
+        error("bd descendants: expected JSON array")
+      else
+        .[]
+        | require_id("bd descendants") as $id
+        | require_status("bd descendants") as $st
+        | select($st == "in_progress")
+        | $id
+      end
+    ')
+    jq_rc=$?
+    set -e
+    if [[ "$jq_rc" -ne 0 ]]; then
+      return 2
+    fi
+    printf '%s' "$ids"
+    return 0
+  fi
+  set +e
+  json=$(bd_json list -s in_progress --sort priority -n 0 --flat 2>/dev/null)
+  rc=$?
+  set -e
+  if [[ "$rc" -eq 2 ]]; then
+    return 2
+  fi
+  if [[ "$rc" -ne 0 ]]; then
+    set +e
+    json=$(bd_json list -s in_progress --sort priority -n 0)
+    rc=$?
+    set -e
+    if [[ "$rc" -ne 0 ]]; then
+      return "$rc"
+    fi
+  fi
+  set +e
+  ids=$(printf '%s' "$json" | jq -r "${jq_bd_preamble}"'
+    unwrap
+    | if type != "array" then
+        error("bd list in_progress: expected JSON array")
+      else
+        .[] | require_id("bd list in_progress")
+      end
+  ')
+  jq_rc=$?
+  set -e
+  if [[ "$jq_rc" -ne 0 ]]; then
+    return 2
+  fi
+  printf '%s' "$ids"
+}
+
+pr_list_matches_id() {
+  local prs=$1
+  local id=$2
+  local want=$3
+  printf '%s' "$prs" | jq -e --arg id "$id" --arg want "$want" --arg prefix "$BRANCH_PREFIX" '
+    def re_quote: gsub("(?<c>[\\\\.^$|?*+()\\[\\]{}])"; "\\\(.c)");
+    def matches:
+      (.headRefName | test("^" + ($prefix | re_quote) + ($id | re_quote) + "(-|$)"))
+      or (
+        (.title | test("(^|[^A-Za-z0-9-])" + ($id | re_quote) + "([^A-Za-z0-9-]|$)"))
+        and ((.headRefName | test("^" + ($prefix | re_quote))) | not)
+      );
+    any(.[];
+      (
+        ($want == "open" and .state == "OPEN")
+        or ($want == "merged" and (.mergedAt != null or .state == "MERGED"))
+      )
+      and matches
+    )
+  ' >/dev/null 2>&1
+}
+
+# Print in-progress ids in resume preference order (open PR, merged PR,
+# cycle log, feat branch/worktree, then remaining). Duplicates omitted.
+ranked_resume_ids() {
+  local ids=()
+  local id
+  local seen="|"
+  local raw
+  # Capture instead of process-substitution: a failing `bd list` must
+  # propagate (process substitution would look like an empty list).
+  raw=$(in_progress_ids "${SCOPE_ID:-}") || return
+  while IFS= read -r id; do
+    [[ -n "$id" ]] && ids+=("$id")
+  done <<< "$raw"
+  (( ${#ids[@]} > 0 )) || return 0
+
+  local prs
+  prs=$(gh pr list --state all --limit 80 --json number,url,headRefName,title,state,mergedAt 2>/dev/null || echo '[]')
+
+  emit_resume_id() {
+    local x=$1
+    [[ -n "$x" ]] || return 0
+    [[ "$seen" == *"|${x}|"* ]] && return 0
+    seen+="${x}|"
+    printf '%s\n' "$x"
+  }
+
+  for id in "${ids[@]}"; do
+    if pr_list_matches_id "$prs" "$id" open; then
+      emit_resume_id "$id"
+    fi
+  done
+  for id in "${ids[@]}"; do
+    if pr_list_matches_id "$prs" "$id" merged; then
+      emit_resume_id "$id"
+    fi
+  done
+  for id in "${ids[@]}"; do
+    if [[ -f "$(cycle_log_path "$id")" ]]; then
+      emit_resume_id "$id"
+    fi
+  done
+  for id in "${ids[@]}"; do
+    if feat_branch_for_id "$id" >/dev/null || worktree_for_id "$id" >/dev/null; then
+      emit_resume_id "$id"
+    fi
+  done
+  for id in "${ids[@]}"; do
+    emit_resume_id "$id"
+  done
+}
+
+# First scoped ready id claim_or_select_ready would take (known
+# non-grouping type after bd show). Empty output means none. Return 2
+# on show/parse failure.
+first_implementable_ready_id() {
+  local ready_ids=$1
+  local candidate show st itype known_rc
+  while IFS= read -r candidate; do
+    [[ -n "$candidate" ]] || continue
+    if ! show=$(bd_json show "$candidate"); then
+      return 2
+    fi
+    if ! st=$(bead_status_from_json "$show"); then
+      return 2
+    fi
+    : "$st"
+    if ! itype=$(bead_type_from_json "$show"); then
+      return 2
+    fi
+    if [[ -z "$itype" ]] || is_grouping_type "$itype"; then
+      continue
+    fi
+    known_rc=0
+    is_known_issue_type "$itype" || known_rc=$?
+    if [[ "$known_rc" -ge 2 ]]; then
+      return 2
+    fi
+    if [[ "$known_rc" -ne 0 ]]; then
+      continue
+    fi
+    printf '%s\n' "$candidate"
+    return 0
+  done <<< "$ready_ids"
+  return 0
+}
+
+# First ranked in-progress id the real resume path would take (known
+# non-grouping type, still in_progress after bd show). Empty output
+# means none. Return 2 on show/parse failure.
+first_implementable_resume_id() {
+  local resume_list=$1
+  local candidate show st itype known_rc
+  while IFS= read -r candidate; do
+    [[ -n "$candidate" ]] || continue
+    if ! show=$(bd_json show "$candidate"); then
+      return 2
+    fi
+    if ! st=$(bead_status_from_json "$show"); then
+      return 2
+    fi
+    if ! itype=$(bead_type_from_json "$show"); then
+      return 2
+    fi
+    if [[ -z "$itype" ]] || is_grouping_type "$itype"; then
+      continue
+    fi
+    known_rc=0
+    is_known_issue_type "$itype" || known_rc=$?
+    if [[ "$known_rc" -ge 2 ]]; then
+      return 2
+    fi
+    if [[ "$known_rc" -ne 0 ]]; then
+      continue
+    fi
+    if [[ "$st" != "in_progress" ]]; then
+      continue
+    fi
+    printf '%s\n' "$candidate"
+    return 0
+  done <<< "$resume_list"
+  return 0
+}
+
+# Set by inspect_bead_progress:
+PR_NUMBER=""
+PR_URL=""
+PR_STATE="none"
+FEAT_BRANCH=""
+WORKTREE_PATH=""
+STAGE="implement"
+
+inspect_bead_progress() {
+  local id=$1
+  local discovered
+
+  PR_NUMBER=""
+  PR_URL=""
+  PR_STATE="none"
+  FEAT_BRANCH=""
+  WORKTREE_PATH=""
+  STAGE="implement"
+
+  FEAT_BRANCH=$(feat_branch_for_id "$id" || true)
+  WORKTREE_PATH=$(worktree_for_id "$id" || true)
+
+  if discovered=$(discover_pr "$id" ""); then
+    IFS=$'\t' read -r PR_NUMBER PR_STATE PR_URL <<<"$discovered"
+  fi
+
+  case "$PR_STATE" in
+    merged)
+      STAGE=close
+      ;;
+    open)
+      STAGE=nurse
+      ;;
+    *)
+      STAGE=implement
+      ;;
+  esac
+}
+
+progress_blurb() {
+  local id=$1
+  cat <<EOF
+Resume context (do not ignore; continue from here, do not start over):
+- bead: ${id}
+- existing open/merged/closed PR: ${PR_STATE}${PR_URL:+ ${PR_URL} (#${PR_NUMBER})}
+- existing feat branch: ${FEAT_BRANCH:-none}
+- existing grok worktree: ${WORKTREE_PATH:-none}
+
+If a ${BRANCH_PREFIX}${id}-* branch or grok worktree already exists, continue that work.
+Do not create a second ${BRANCH_PREFIX}${id}-* branch. Do not open a second PR.
+If an open PR already exists: finish any missing commits, push, request Copilot, STOP.
+If a previous PR was closed without merging, reopen it or open a new PR from the existing branch.
+EOF
+}
+
+agent_context_blurb() {
+  local extra=""
+  if [[ -f "$REPO_ROOT/AGENTS.md" ]]; then
+    extra="${extra}
+Also follow AGENTS.md (Bead factory loop section if present)."
+  fi
+  if [[ -f "$REPO_ROOT/.grok/skills/bead-cycle/SKILL.md" ]]; then
+    extra="${extra}
+Also follow .grok/skills/bead-cycle/SKILL.md."
+  fi
+  printf '%s' "$extra"
+}
+
+implement_prompt() {
+  local id=$1
+  cat <<EOF
+You are running unattended as part of bead-cycle.
+
+Implement exactly ONE already-claimed bead: ${id}.
+Do not claim a different bead. Do not start a second bead.
+$(agent_context_blurb)
+
+$(progress_blurb "$id")
+
+Then:
+1. bd show ${id} --json --quiet --no-color
+2. Implement only that bead (or finish the in-progress implementation).
+   - Branch: ${BRANCH_PREFIX}${id}-short-slug from latest ${DEFAULT_BRANCH} (reuse it if it already exists).
+   - If you discover extra work, file it with:
+     bd create "..." -t task -p 2 --deps discovered-from:${id} --json --quiet --no-color
+     Do not silently expand scope.
+3. When the bead's acceptance criteria pass locally:
+   - commit (include bd-${id} in the message)
+   - gh pr create --fill --base ${DEFAULT_BRANCH}  (or reopen/push to the existing PR)
+   - request Copilot:
+     gh pr edit <n> --add-reviewer ${COPILOT_REVIEWER}
+4. STOP. Do not poll Copilot, do not merge, do not close the bead, do not start another bead.
+
+Always end your last message with exactly one line of the form:
+BEAD_CYCLE_RESULT={"status":"pr_open","bead_id":"${id}","pr_number":123,"pr_url":"https://github.com/..."}
+
+If you cannot open a PR, use status "failed" and JSON null for pr_number and pr_url.
+Use machine flags: --json --quiet --no-color. Never run bd edit.
+EOF
+}
+
+fix_prompt() {
+  local id=$1
+  local pr=$2
+  local url=$3
+  local round=$4
+  cat <<EOF
+You are running unattended as part of bead-cycle, Copilot nurse round ${round} of ${MAX_ROUNDS}.
+
+Bead: ${id}
+PR: ${url} (#${pr})
+
+This may be a resumed run after an interruption. Checkout the existing PR branch
+(or grok worktree); do not start a new branch.
+
+Address every unresolved GitHub Copilot review comment on this PR.
+- Checkout the PR branch.
+- Fix actionable Copilot comments in code, commit, and push.
+- Reply on threads only after the fix is pushed, referencing the commit SHA.
+- Do not start other beads. Do not merge. Do not close the bead.
+- After pushing, request another Copilot review:
+  gh pr edit ${pr} --add-reviewer ${COPILOT_REVIEWER}
+
+Always end your last message with exactly one line of the form:
+BEAD_CYCLE_RESULT={"status":"pr_open","bead_id":"${id}","pr_number":${pr},"pr_url":"${url}"}
+
+Use machine flags: --json --quiet --no-color. Never run bd edit.
+EOF
+}
+
+GROK_CWD=""
+CREATE_WORKTREE=1
+
+run_grok() {
+  local prompt=$1
+  local out_file=$2
+  local prompt_file
+  if ! prompt_file=$(cycle_mktemp "bead-cycle-prompt"); then
+    log "error: could not create temp prompt file"
+    return 1
+  fi
+  # run_grok is invoked as `run_grok ... || EC=$?`, which disables
+  # errexit. A failed prompt write must not launch Grok with a missing
+  # or partial prompt.
+  if ! printf '%s\n' "$prompt" >"$prompt_file"; then
+    log "error: could not write temp prompt file"
+    rm -f "$prompt_file"
+    return 1
+  fi
+
+  local args=(
+    --no-auto-update
+    --always-approve
+    --trust
+    --no-plan
+    --verbatim
+    --max-turns "$MAX_TURNS"
+    --cwd "$GROK_CWD"
+    --prompt-file "$prompt_file"
+  )
+  if [[ "$CREATE_WORKTREE" -eq 1 ]]; then
+    args+=(--worktree="bead-${BEAD_ID}")
+  fi
+
+  log "==> grok ${args[*]}"
+  local ec=0
+  set +e
+  grok "${args[@]}" 2>&1 | tee -a "$LOG_FILE" | tee "$out_file"
+  ec=${PIPESTATUS[0]}
+  set -e
+  rm -f "$prompt_file"
+  return "$ec"
+}
+
+extract_result_json() {
+  local file=$1
+  local line json
+  line=$(grep -E 'BEAD_CYCLE_RESULT=\{' "$file" 2>/dev/null | tail -n 1 || true)
+  [[ -n "$line" ]] || return 1
+  json=$(printf '%s' "$line" | sed 's/.*BEAD_CYCLE_RESULT=//')
+  printf '%s' "$json" | jq -c '{status,bead_id,pr_number,pr_url}' 2>/dev/null
+}
+
+apply_discovered_pr() {
+  local discovered=$1
+  IFS=$'\t' read -r PR_NUMBER PR_STATE PR_URL <<<"$discovered"
+}
+
+copilot_reviews_json() {
+  local pr=$1
+  local raw
+  # Explicit status: run_one_bead is invoked with `||`, which disables
+  # errexit inside the callee. A failed reviews query must not look like [].
+  if ! raw=$(NO_COLOR=1 gh api "repos/${OWNER_REPO}/pulls/${pr}/reviews" --paginate); then
+    return 1
+  fi
+  raw=$(printf '%s' "$raw" | sed 's/\x1b\[[0-9;]*m//g')
+  printf '%s' "$raw" | jq -s -c '
+        (if length == 0 then [] else add end)
+        | (if type == "array" then . else [.] end)
+        | [.[] | select((.user.login // "") | test("copilot"; "i"))]
+      '
+}
+
+latest_copilot_review() {
+  local reviews=$1
+  printf '%s' "$reviews" | jq -c 'if length == 0 then empty else .[-1] end'
+}
+
+review_is_approval() {
+  local state=$1
+  local body=$2
+  [[ "$state" == "APPROVED" ]] && return 0
+  local lower
+  lower=$(printf '%s' "$body" | tr '[:upper:]' '[:lower:]')
+  if [[ "$lower" == *"not ready"* ]]; then
+    return 1
+  fi
+  if [[ "$lower" == *"ready to approve"* || "$lower" == *"approved"* ]]; then
+    return 0
+  fi
+  return 1
+}
+
+copilot_unresolved_threads() {
+  local pr=$1
+  local cursor=""
+  local all='[]'
+  while true; do
+    local args=(-f "owner=${OWNER}" -f "name=${REPO}" -F "number=${pr}")
+    if [[ -n "$cursor" ]]; then
+      args+=(-f "cursor=${cursor}")
+    fi
+    local page
+    if ! page=$(NO_COLOR=1 gh api graphql "${args[@]}" -f query='
+      query($owner: String!, $name: String!, $number: Int!, $cursor: String) {
+        repository(owner: $owner, name: $name) {
+          pullRequest(number: $number) {
+            reviewThreads(first: 50, after: $cursor) {
+              pageInfo { hasNextPage endCursor }
+              nodes {
+                id
+                isResolved
+                comments(first: 1) {
+                  nodes {
+                    author { login }
+                    body
+                    url
+                    path
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    '); then
+      return 1
+    fi
+    page=$(printf '%s' "$page" | sed 's/\x1b\[[0-9;]*m//g')
+    if ! printf '%s' "$page" | jq -e '.data.repository.pullRequest.reviewThreads | type == "object"' >/dev/null; then
+      return 1
+    fi
+    local nodes
+    nodes=$(printf '%s' "$page" | jq '.data.repository.pullRequest.reviewThreads.nodes // []') || return 1
+    all=$(printf '%s\n%s\n' "$all" "$nodes" | jq -s '.[0] + .[1]') || return 1
+    local has_next
+    has_next=$(printf '%s' "$page" | jq -r '.data.repository.pullRequest.reviewThreads.pageInfo.hasNextPage // false') || return 1
+    if [[ "$has_next" != "true" ]]; then
+      break
+    fi
+    cursor=$(printf '%s' "$page" | jq -r '.data.repository.pullRequest.reviewThreads.pageInfo.endCursor // empty')
+    [[ -n "$cursor" ]] || break
+  done
+  printf '%s' "$all" | jq -c '
+    [.[]
+      | select(.isResolved == false)
+      | select((.comments.nodes[0].author.login // "") | test("copilot"; "i"))
+      | {
+          id,
+          path: (.comments.nodes[0].path // ""),
+          url: (.comments.nodes[0].url // ""),
+          body: (.comments.nodes[0].body // "")
+        }
+    ]
+  ' || return 1
+}
+
+thread_id_set() {
+  # Caller must check this result. Swallowing a jq/sort/paste failure
+  # yields an empty ID set, which the nurse loop can treat as "no new
+  # unresolved comments" and merge while threads are still open.
+  printf '%s' "$1" | jq -r '.[].id' | sort | paste -sd, -
+}
+
+pr_head_oid() {
+  local pr=$1
+  gh pr view "$pr" --json headRefOid --jq '.headRefOid'
+}
+
+request_copilot_review() {
+  local pr=$1
+  if gh pr edit "$pr" --add-reviewer "$COPILOT_REVIEWER" >/dev/null 2>&1; then
+    return 0
+  fi
+  # Already a reviewer: drop and re-add so Copilot re-reviews.
+  NO_COLOR=1 gh api -X DELETE "repos/${OWNER_REPO}/pulls/${pr}/requested_reviewers" \
+    -f "reviewers[]=${COPILOT_REVIEWER}" >/dev/null 2>&1 || true
+  NO_COLOR=1 gh api -X POST "repos/${OWNER_REPO}/pulls/${pr}/requested_reviewers" \
+    -f "reviewers[]=${COPILOT_REVIEWER}" >/dev/null
+}
+
+# stdout is compact JSON for the selected Copilot review (the nurse loop
+# captures it). Progress goes through log() to stderr, not stdout.
+wait_for_copilot_review() {
+  local pr=$1
+  local after_id=${2:-}
+  local deadline=$((SECONDS + REVIEW_TIMEOUT))
+  local last_note=0
+
+  while (( SECONDS < deadline )); do
+    local head reviews review rid rstate rsha newer=0 on_head=0
+    head=$(pr_head_oid "$pr") || return 1
+    reviews=$(copilot_reviews_json "$pr") || return 1
+    review=$(latest_copilot_review "$reviews") || true
+    if [[ -n "$review" ]]; then
+      rid=$(printf '%s' "$review" | jq -r '.id')
+      rstate=$(printf '%s' "$review" | jq -r '.state // empty')
+      rsha=$(printf '%s' "$review" | jq -r '.commit_id // empty')
+      if [[ "$rstate" != "PENDING" ]]; then
+        [[ -z "$after_id" || "$rid" != "$after_id" ]] && newer=1
+        [[ -n "$rsha" && "$rsha" == "$head" ]] && on_head=1
+        if [[ "$newer" -eq 1 && ( "$on_head" -eq 1 || -z "$after_id" ) ]]; then
+          printf '%s\n' "$review"
+          return 0
+        fi
+      fi
+    fi
+    if (( SECONDS - last_note >= POLL_SECONDS )); then
+      log "waiting for Copilot review on PR #${pr} (head ${head:0:8})..."
+      last_note=$SECONDS
+    fi
+    sleep "$POLL_SECONDS"
+  done
+
+  local reviews review rstate
+  reviews=$(copilot_reviews_json "$pr") || return 1
+  review=$(latest_copilot_review "$reviews") || true
+  rstate=$(printf '%s' "${review:-}" | jq -r '.state // empty' 2>/dev/null || true)
+  if [[ -n "$review" && "$rstate" != "PENDING" ]]; then
+    log "warning: timed out waiting for a new Copilot review; using latest existing review"
+    printf '%s\n' "$review"
+    return 0
+  fi
+  return 1
+}
+
+wait_for_ci() {
+  local pr=$1
+  local deadline=$((SECONDS + CI_TIMEOUT))
+  while (( SECONDS < deadline )); do
+    local tmp ec
+    if ! tmp=$(mktemp); then
+      log "error: could not create temp file for CI checks"
+      return 1
+    fi
+    set +e
+    gh pr checks "$pr" >"$tmp" 2>&1
+    ec=$?
+    set -e
+    if grep -qiE 'no (checks|status checks)' "$tmp"; then
+      rm -f "$tmp"
+      log "no CI checks reported"
+      return 0
+    fi
+    case "$ec" in
+      0)
+        cat "$tmp"
+        rm -f "$tmp"
+        return 0
+        ;;
+      8)
+        log "waiting for CI on PR #${pr}..."
+        rm -f "$tmp"
+        sleep "$POLL_SECONDS"
+        ;;
+      *)
+        cat "$tmp"
+        rm -f "$tmp"
+        return 1
+        ;;
+    esac
+  done
+  log "warning: timed out waiting for CI"
+  return 1
+}
+
+# Try configured merge methods in order (default squash then merge).
+merge_pr() {
+  local pr=$1
+  local methods=$MERGE_METHODS
+  local method
+  while [[ -n "$methods" ]]; do
+    if [[ "$methods" == *","* ]]; then
+      method=${methods%%,*}
+      methods=${methods#*,}
+    else
+      method=$methods
+      methods=""
+    fi
+    method=$(trim_ws "$method")
+    case "$method" in
+      squash)
+        gh pr merge "$pr" --squash --auto && return 0
+        ;;
+      merge)
+        gh pr merge "$pr" --merge --auto && return 0
+        ;;
+      rebase)
+        gh pr merge "$pr" --rebase --auto && return 0
+        ;;
+      '')
+        ;;
+      *)
+        log "warning: unknown merge method ${method}"
+        ;;
+    esac
+  done
+  return 1
+}
+
+# `gh pr merge --auto` can succeed after enabling auto-merge while the PR
+# is still OPEN. Do not bd-close until GitHub reports MERGED.
+wait_for_pr_merged() {
+  local pr=$1
+  local deadline=$((SECONDS + CI_TIMEOUT))
+  local state last_note=0
+  while (( SECONDS < deadline )); do
+    state=$(gh pr view "$pr" --json state --jq '.state // empty') || return 1
+    if [[ "$state" == "MERGED" ]]; then
+      return 0
+    fi
+    if [[ "$state" == "CLOSED" ]]; then
+      log "PR #${pr} closed without merging"
+      return 1
+    fi
+    if (( SECONDS - last_note >= POLL_SECONDS )); then
+      log "waiting for PR #${pr} to merge (state=${state:-unknown})..."
+      last_note=$SECONDS
+    fi
+    sleep "$POLL_SECONDS"
+  done
+  log "warning: timed out waiting for PR #${pr} to merge"
+  return 1
+}
+
+print_summary() {
+  local bead=$1
+  local pr_url=$2
+  local copilot=$3
+  local rounds=$4
+  local merge=$5
+  # Informational only — not the factory-loop ready fetch. A failure here
+  # must not look like a successful count and does not change the cycle
+  # exit code (claim/resume already applied the hard-error contract).
+  local ready_count="(query failed)" ready_json
+  if ready_json=$(fetch_ready_json); then
+    if ! ready_count=$(ready_count_from_json "$ready_json"); then
+      log "warning: failed to parse ready count for summary"
+      ready_count="(query failed)"
+    fi
+  else
+    log "warning: failed to list ready beads for summary"
+  fi
+  cat <<EOF
+
+======== bead-cycle summary ========
+bead id:         ${bead}
+epic scope:      ${SCOPE_ID:-none}
+PR:              ${pr_url:-none}
+Copilot:         ${copilot}
+review rounds:   ${rounds}
+merge/close:     ${merge}
+next ready:      ${ready_count}
+log:             ${LOG_FILE:-none}
+====================================
+EOF
+}
+
+sync_git() {
+  local current dirty=0
+  current=$(git branch --show-current)
+  git fetch origin --prune || log "warning: git fetch failed"
+  git diff --quiet || dirty=1
+  git diff --cached --quiet || dirty=1
+  if [[ "$dirty" -eq 1 ]]; then
+    log "warning: working tree is dirty; skip git pull --rebase so interrupted work is kept"
+    return 0
+  fi
+  if [[ "$current" == "$DEFAULT_BRANCH" ]]; then
+    log "==> git pull --rebase"
+    git pull --rebase || die "git pull --rebase failed"
+  else
+    log "==> skip git pull --rebase (on ${current}, not ${DEFAULT_BRANCH})"
+  fi
+}
+
+configure_grok_cwd() {
+  GROK_CWD=$REPO_ROOT
+  CREATE_WORKTREE=$USE_WORKTREE
+  if [[ -n "$WORKTREE_PATH" && -d "$WORKTREE_PATH" ]]; then
+    GROK_CWD=$WORKTREE_PATH
+    CREATE_WORKTREE=0
+    log "reusing grok worktree ${WORKTREE_PATH}"
+  fi
+}
+
+# mode: select (dry-run) | claim
+# Uses READY_JSON. Sets BEAD_ID and SHOW_JSON. Claim also sets BEAD_STATUS.
+# QUEUE_EMPTY when every remaining candidate is epic/milestone/unknown (no
+# implementable non-grouping ready item). bd show/claim/list/parse failures
+# are a hard error.
+# A failed `bd show` aborts immediately so a later success cannot hide it.
+# A successful --claim whose JSON is unparseable, whose issue_type is
+# empty or not in `bd types`, or whose status is missing/non-string/not
+# in_progress is unclaimed and aborts (do not continue to another candidate).
+# A verified post-claim epic or milestone is unclaimed and the next candidate
+# may be tried.
+# A `bd update --claim` *command* failure of one candidate still continues.
+claim_or_select_ready() {
+  local mode=$1
+  local candidate itype claimed_type candidates show_status
+  local backend_failed=0
+
+  # Capture instead of process-substitution: a failing jq parse must not
+  # look like an empty candidate list (that would QUEUE_EMPTY).
+  if ! candidates=$(non_epic_ids_from_ready "$READY_JSON"); then
+    die "failed to parse bd ready JSON; not treating as QUEUE_EMPTY"
+  fi
+
+  while IFS= read -r candidate; do
+    [[ -n "$candidate" ]] || continue
+    if ! SHOW_JSON=$(bd_json show "$candidate"); then
+      die "bd show failed for ${candidate}; not skipping to a later candidate"
+    fi
+    if ! show_status=$(bead_status_from_json "$SHOW_JSON"); then
+      die "failed to parse status for ${candidate}; not claiming"
+    fi
+    : "$show_status"
+    if ! itype=$(bead_type_from_json "$SHOW_JSON"); then
+      die "failed to parse issue_type for ${candidate}"
+    fi
+    if [[ -z "$itype" ]]; then
+      log "refusing ${candidate}: cannot determine issue_type (fail closed)"
+      continue
+    fi
+    if is_grouping_type "$itype"; then
+      log "refusing to implement ${itype} ${candidate}; skipping"
+      continue
+    fi
+    if ! is_known_issue_type "$itype"; then
+      log "refusing ${candidate}: unknown issue_type ${itype} (not in bd types)"
+      continue
+    fi
+    if [[ "$mode" == "claim" ]]; then
+      if ! claim_bead "$candidate"; then
+        log "claim failed for ${candidate}"
+        backend_failed=1
+        continue
+      fi
+      if ! claimed_type=$(bead_type_from_json "$CLAIM_JSON"); then
+        unclaim_refused "$candidate"
+        die "failed to parse issue_type after claim of ${candidate}"
+      fi
+      if [[ -z "$claimed_type" ]]; then
+        log "refusing ${candidate} after claim (type unknown); unclaiming"
+        unclaim_refused "$candidate"
+        die "claimed ${candidate} but issue_type was empty; unclaimed. not claiming another bead"
+      fi
+      if is_grouping_type "$claimed_type"; then
+        log "refusing ${candidate} after claim (type=${claimed_type}); unclaiming"
+        unclaim_refused "$candidate"
+        continue
+      fi
+      if ! is_known_issue_type "$claimed_type"; then
+        unclaim_refused "$candidate"
+        die "claimed ${candidate} but issue_type was ${claimed_type} (not in bd types); unclaimed. not claiming another bead"
+      fi
+      log "claimed ${candidate}"
+    else
+      log "dry-run: would claim next ready non-epic bead ${candidate}"
+    fi
+    BEAD_ID=$candidate
+    return 0
+  done <<< "$candidates"
+
+  if [[ "$backend_failed" -eq 1 ]]; then
+    die "failed to inspect/claim a ready non-epic bead (bd error); ready work may still exist"
+  fi
+  maybe_queue_empty
+}
+
+# --- drain / epic close-out ---
+
+# Epic number from labels (`epic-N`) or title (`E<n>`). Return 0 with the
+# decimal number, or empty stdout when a well-formed show has neither.
+# Return 1 on jq/parse failure (structured error, present-but-wrong-type
+# labels/title). Callers must not treat rc 1 as "no number".
+epic_number_from_json() {
+  local json=$1
+  local n
+  # Presence, not `//`: top-level labels/title win even when empty, matching
+  # issue_type_field. Wrapped `{issue:{...}}` is used only when the outer
+  # object omits the key. Normalize 08/09 from E08/E09 titles to decimal.
+  # Do not swallow jq errors: a malformed field is a close-eval failure,
+  # not an unmet close-out (empty number).
+  n=$(printf '%s' "$json" | jq -r "${jq_bd_preamble}"'
+    unwrap
+    | (if type == "array" then .[0] else . end)
+    | reject_error("bd show")
+    | (if has("labels") then
+         if (.labels | type) == "array" then .labels
+         else error("bd show: labels is not an array") end
+       elif (.issue | type) == "object" and (.issue | has("labels")) then
+         if (.issue.labels | type) == "array" then .issue.labels
+         else error("bd show: labels is not an array") end
+       else [] end)
+    | map(select(type == "string") | select(test("^epic-[0-9]+$")) | sub("^epic-"; ""))
+    | first // empty
+  ') || return 1
+  if [[ -n "$n" ]]; then
+    decimal_int "$n" || return 1
+    return 0
+  fi
+  n=$(printf '%s' "$json" | jq -r "${jq_bd_preamble}"'
+    unwrap
+    | (if type == "array" then .[0] else . end)
+    | reject_error("bd show")
+    | (if has("title") then
+         if (.title | type) == "string" then .title
+         else error("bd show: title is not a string") end
+       elif (.issue | type) == "object" and (.issue | has("title")) then
+         if (.issue.title | type) == "string" then .issue.title
+         else error("bd show: title is not a string") end
+       else "" end)
+    | if test("^E[0-9]+\\b") then capture("^E(?<n>[0-9]+)\\b") | .n
+      else empty end
+  ') || return 1
+  if [[ -n "$n" ]]; then
+    decimal_int "$n" || return 1
+  fi
+}
+
+# Look up close-out id for epic_id from origin DRAIN_ID_MAP.
+# Return 0 with the close-out id (or empty if epic/close keys are absent).
+# Return 1 on origin read/JSON failure. Return 3 if the epic key maps to
+# another id (stdout is that other id; do not use that epic's close id).
+close_out_id_for_epic() {
+  local n=$1
+  local epic_id=$2
+  local map_json mapped_epic close_id map_path epic_key close_key
+  [[ -n "$DRAIN_ID_MAP" ]] || return 0
+  [[ -n "$n" ]] || return 0
+  [[ -n "$epic_id" ]] || return 1
+  map_path=$DRAIN_ID_MAP
+  epic_key=$(expand_n_tokens "$DRAIN_ID_MAP_EPIC_KEY" "$n")
+  close_key=$(expand_n_tokens "$DRAIN_ID_MAP_CLOSE_KEY" "$n")
+  # Origin tree is authoritative, matching write-up/changeset checks. A
+  # local or dirty working-copy map must not supply the close-out id.
+  # Missing path (origin readable) is "no mapping". An unreadable origin
+  # ref is a close-evaluation error — do not treat every cat-file
+  # failure as an absent blob.
+  if git cat-file -e "origin/${DEFAULT_BRANCH}:${map_path}" 2>/dev/null; then
+    :
+  elif git rev-parse --verify "origin/${DEFAULT_BRANCH}^{commit}" >/dev/null 2>&1; then
+    return 0
+  else
+    return 1
+  fi
+  map_json=$(git show "origin/${DEFAULT_BRANCH}:${map_path}") || return 1
+  if ! mapped_epic=$(jq -r --arg k "$epic_key" '
+    if type != "object" then error("id-map: expected object")
+    elif has($k) | not then empty
+    elif .[$k] | type != "string" then error("id-map: epic key is not a string")
+    elif .[$k] == "" then error("id-map: epic key is empty")
+    else .[$k]
+    end
+  ' <<<"$map_json"); then
+    return 1
+  fi
+  if [[ -z "$mapped_epic" ]]; then
+    return 0
+  fi
+  if [[ "$mapped_epic" != "$epic_id" ]]; then
+    printf '%s' "$mapped_epic"
+    return 3
+  fi
+  if ! close_id=$(jq -r --arg k "$close_key" '
+    if type != "object" then error("id-map: expected object")
+    elif has($k) | not then empty
+    elif .[$k] | type != "string" then error("id-map: close key is not a string")
+    elif .[$k] == "" then error("id-map: close key is empty")
+    else .[$k]
+    end
+  ' <<<"$map_json"); then
+    return 1
+  fi
+  printf '%s' "$close_id"
+}
+
+epic_status_row() {
+  local id=$1
+  local json
+  json=$(bd_json epic status) || return 1
+  # Beads lists only open epics. An error object inside the array is not
+  # "no matching row": reject it so evaluate_epic_close cannot treat a
+  # failed status query as eligible=false / already-closed success.
+  printf '%s' "$json" | jq -c --arg id "$id" "${jq_bd_preamble}"'
+    unwrap
+    | reject_error("bd epic status")
+    | if type != "array" then error("bd epic status: expected JSON array")
+      else
+        map(
+          if type != "object" then error("bd epic status: non-object row")
+          else
+            reject_error("bd epic status")
+            | if (has("epic") | not) then error("bd epic status: row missing epic")
+              elif (.epic | type) != "object" then error("bd epic status: epic is not an object")
+              elif (.epic | has("id") | not) then error("bd epic status: epic missing id")
+              elif (.epic.id | type) != "string" then error("bd epic status: epic.id is not a string")
+              elif .epic.id == "" then error("bd epic status: epic.id is empty")
+              else .
+              end
+          end
+        )
+        | [.[] | select(.epic.id == $id)]
+        | first // empty
+      end
+  '
+}
+
+children_json() {
+  local id=$1
+  local json parsed
+  json=$(bd_json children "$id") || return $?
+  if ! parsed=$(printf '%s' "$json" | jq -c "${jq_bd_preamble}"'
+    unwrap
+    | if type == "array" then .
+      elif type == "object" and (.issues | type == "array") then .issues
+      else error("bd children: unexpected JSON") end
+  '); then
+    return 2
+  fi
+  printf '%s\n' "$parsed"
+}
+
+# Every descendant of parent (direct and nested). bd children / bd list
+# --parent are direct-only; close-out and resume must not miss grandchildren.
+# One `bd list --all` plus an in-process parent walk: a per-node children
+# query would be O(n) subprocesses per drain iteration (and O(n^2) over a
+# full epic). Fail closed on list/parse error. Cycle-safe.
+# Sets DESCENDANTS_JSON in the caller shell. Do not capture this function
+# with command substitution — that runs it in a subshell and drops the
+# cache assignments.
+DESCENDANTS_CACHE_PARENT=""
+DESCENDANTS_CACHE_JSON=""
+DESCENDANTS_JSON=""
+
+invalidate_descendants_cache() {
+  DESCENDANTS_CACHE_PARENT=""
+  DESCENDANTS_CACHE_JSON=""
+  DESCENDANTS_JSON=""
+}
+
+descendants_json() {
+  local parent=$1
+  local json parsed jq_rc=0 rc=0
+  DESCENDANTS_JSON=""
+  if [[ "$DESCENDANTS_CACHE_PARENT" == "$parent" && -n "${DESCENDANTS_CACHE_JSON:-}" ]]; then
+    DESCENDANTS_JSON=$DESCENDANTS_CACHE_JSON
+    return 0
+  fi
+  # Same contract as in_progress_ids: fall back from --flat only on a
+  # command failure. Malformed flat JSON is a parse error (return 2).
+  set +e
+  json=$(bd_json list --all --brief --flat -n 0 2>/dev/null)
+  rc=$?
+  set -e
+  if [[ "$rc" -eq 2 ]]; then
+    return 2
+  fi
+  if [[ "$rc" -ne 0 ]]; then
+    json=$(bd_json list --all --brief -n 0) || return $?
+  fi
+  # Flatten id/status/title/parent onto each cached row so later `.id` /
+  # `.status` readers still see wrapped `{issue:{...}}` records.
+  set +e
+  parsed=$(printf '%s' "$json" | jq -c --arg parent "$parent" "${jq_bd_preamble}"'
+    unwrap
+    | reject_error("bd list")
+    | if type == "array" then .
+      elif type == "object" and (.issues | type == "array") then .issues
+      else error("bd list: unexpected JSON") end
+    | map(if type == "object" then . else error("bd list: non-object record") end)
+    | . as $records
+    | ($records | map(require_id("bd descendants"))) as $ids
+    | if ($ids | unique | length) != ($ids | length) then
+        error("bd descendants: duplicate id")
+      else $records end
+    | def parent_of: parent_id("bd descendants");
+      . as $all
+      | def kids($p):
+          [$all[] | select(parent_of == $p)];
+        def walk($p; $seen):
+          kids($p)[]
+          | require_id("bd descendants") as $cid
+          | select($seen[$cid] | not)
+          | require_status("bd descendants") as $st
+          | optional_string_field("title") as $title
+          | (. + {id: $cid, status: $st, title: $title, parent: $p}),
+            walk($cid; $seen + {($cid): true});
+        [walk($parent; {($parent): true})]
+  ')
+  jq_rc=$?
+  set -e
+  if [[ "$jq_rc" -ne 0 ]]; then
+    return 2
+  fi
+  DESCENDANTS_CACHE_PARENT=$parent
+  DESCENDANTS_CACHE_JSON=$parsed
+  DESCENDANTS_JSON=$parsed
+}
+
+json_array_has_id() {
+  local json=$1
+  local id=$2
+  printf '%s' "$json" | jq -e --arg id "$id" '
+    type == "array" and any(.[]; ((.id | type) == "string") and .id == $id)
+  ' >/dev/null
+}
+
+epic_number_in_writeup_range() {
+  local n=$1
+  [[ -n "$n" ]] || return 1
+  if [[ -n "$DRAIN_WRITEUP_N_MIN" ]] && (( n < DRAIN_WRITEUP_N_MIN )); then
+    return 1
+  fi
+  if [[ -n "$DRAIN_WRITEUP_N_MAX" ]] && (( n > DRAIN_WRITEUP_N_MAX )); then
+    return 1
+  fi
+  return 0
+}
+
+# Refresh origin/${DEFAULT_BRANCH} before close-out artifact checks.
+# --dry-run must not mutate .git; evaluate against already-fetched refs.
+refresh_origin_tree() {
+  if [[ "${DRY_RUN:-0}" -eq 1 ]]; then
+    return 0
+  fi
+  git fetch origin --prune
+}
+
+# Origin tree is the only accepted close-out source. A clean file on the
+# current branch (sync_git skips pull when not on DEFAULT_BRANCH) must
+# not satisfy presence or headings. A failed ls-tree is an eval error,
+# not an empty artifact list.
+list_origin_paths() {
+  git ls-tree -r --name-only "origin/${DEFAULT_BRANCH}"
+}
+
+matching_epic_docs() {
+  local n re origin_hits glob
+  n=$(decimal_int "$1") || return 1
+  [[ -n "$DRAIN_WRITEUP_GLOB" ]] || return 1
+  # Called as the left of `||`, so errexit is off: check the glob
+  # explicitly. An out-of-range n must not become an empty grep that
+  # matches every origin path.
+  epic_number_in_writeup_range "$n" || return 1
+  glob=$(expand_n_tokens "$DRAIN_WRITEUP_GLOB" "$n")
+  re=$(glob_to_path_regex "$glob") || return 1
+  origin_hits=$(list_origin_paths) || return 2
+  printf '%s\n' "$origin_hits" | grep -E "$re" | grep -vE '/_template\.md$' || true
+}
+
+matching_changesets() {
+  local origin_hits re
+  [[ -n "$DRAIN_CHANGESET_GLOB" ]] || return 1
+  origin_hits=$(list_origin_paths) || return 2
+  re=$(glob_to_path_regex "$DRAIN_CHANGESET_GLOB") || return 1
+  printf '%s\n' "$origin_hits" | grep -E "$re" \
+    | grep -vE '/README\.md$' || true
+}
+
+# Drop CommonMark fenced code (``` / ~~~), HTML comments, and HTML blocks
+# so a sample `## Features` inside a fence, comment, <pre>, or <div>
+# cannot satisfy close-out. Unclosed fences/comments/HTML consume the
+# rest of the document (fail closed). Detect fence and HTML-block
+# starts on the original line before stripping comments so a fence
+# opener that contains `<!--` (or an HTML-block start like `<div><!--`)
+# cannot leave `inf` unset and later emit headings after `-->`. Once an
+# HTML comment
+# closes, discard the rest of that source line so `<!-- x -->## Features`
+# cannot become a heading. Type 1 tags (pre/script/style/textarea) run
+# until the matching close tag; other HTML blocks end at a blank line
+# (CommonMark types 6–7).
+markdown_non_code_text() {
+  awk '
+    function ltrim3(s,   i) {
+      i = 1
+      while (i <= 3 && i <= length(s) && substr(s, i, 1) == " ") i++
+      return substr(s, i)
+    }
+    function fence_info(s,   t, ch, n, i) {
+      t = ltrim3(s)
+      if (t == "") return 0
+      ch = substr(t, 1, 1)
+      if (ch != "`" && ch != "~") return 0
+      n = 0
+      for (i = 1; i <= length(t) && substr(t, i, 1) == ch; i++) n++
+      if (n < 3) return 0
+      fence_ch = ch
+      fence_n = n
+      fence_rest = substr(t, n + 1)
+      return 1
+    }
+    function strip_html_comments(s,   out, i, start, end, chunk) {
+      out = ""
+      i = 1
+      while (i <= length(s)) {
+        if (inhtml) {
+          end = index(substr(s, i), "-->")
+          if (end == 0) return ""
+          inhtml = 0
+          # The line that contains --> is part of the comment. Do not
+          # promote a suffix such as `<!-- ignored -->## Features`.
+          return out
+        } else {
+          start = index(substr(s, i), "<!--")
+          if (start == 0) {
+            out = out substr(s, i)
+            break
+          }
+          out = out substr(s, i, start - 1)
+          i = i + start + 3
+          inhtml = 1
+        }
+      }
+      return out
+    }
+    function type1_start(s,   t) {
+      t = tolower(ltrim3(s))
+      if (t ~ /^<pre([ \t>]|$)/) { type1_tag = "pre"; return 1 }
+      if (t ~ /^<script([ \t>]|$)/) { type1_tag = "script"; return 1 }
+      if (t ~ /^<style([ \t>]|$)/) { type1_tag = "style"; return 1 }
+      if (t ~ /^<textarea([ \t>]|$)/) { type1_tag = "textarea"; return 1 }
+      return 0
+    }
+    function type1_end(s) {
+      return index(tolower(s), "</" type1_tag ">") > 0
+    }
+    function html_block_start(s,   t) {
+      t = ltrim3(s)
+      if (t ~ /^<\?/) return 1
+      if (t ~ /^<!\[/) return 1
+      if (t ~ /^<![A-Za-z]/) return 1
+      if (t ~ /^<\/?[A-Za-z]/) return 1
+      return 0
+    }
+    function is_blank(s) {
+      return s ~ /^[ \t]*$/
+    }
+    BEGIN { inf = 0; inhtml = 0; inpre = 0; inblock = 0; och = ""; on = 0; type1_tag = "" }
+    {
+      sub(/\r$/, "")
+      orig = $0
+      # Continue a spanning HTML comment first: comment interiors must
+      # not be re-parsed as fences or HTML blocks.
+      if (inhtml) {
+        strip_html_comments(orig)
+        next
+      }
+      # Fence/HTML-block state transitions use the original line so a
+      # fence opener containing `<!--` is still a fence.
+      if (inpre) {
+        if (type1_end(orig)) inpre = 0
+        next
+      }
+      if (inblock) {
+        if (is_blank(orig)) inblock = 0
+        next
+      }
+      if (inf) {
+        if (fence_info(orig) && fence_ch == och && fence_n >= on && fence_rest ~ /^[ \t]*$/) {
+          inf = 0
+        }
+        next
+      }
+      if (type1_start(orig)) {
+        if (!type1_end(orig)) inpre = 1
+        next
+      }
+      if (html_block_start(orig)) {
+        if (!is_blank(orig)) inblock = 1
+        next
+      }
+      if (fence_info(orig)) {
+        inf = 1
+        och = fence_ch
+        on = fence_n
+        next
+      }
+      line = strip_html_comments(orig)
+      if (inhtml) next
+      print line
+    }
+  '
+}
+
+doc_has_required_headings() {
+  local path=$1
+  local body="" visible=""
+  if ! git cat-file -e "origin/${DEFAULT_BRANCH}:${path}" 2>/dev/null; then
+    return 1
+  fi
+  body=$(git show "origin/${DEFAULT_BRANCH}:${path}") || return 1
+  # Headings inside fenced code, HTML comments, or HTML blocks are not sections.
+  if ! visible=$(printf '%s\n' "$body" | markdown_non_code_text); then
+    return 1
+  fi
+  # Anchor the required words at the start of the heading text so
+  # `## Not Features` cannot satisfy the gate. Require a heading
+  # boundary after each phrase so `## FeaturesX`, `## How to tester`,
+  # and `## Changelists` fail, while template suffixes
+  # (`Features shipped`, `How to test (manual)`) still match.
+  # Here-string: grep -q can SIGPIPE a piped printf under pipefail.
+  if [[ -z "$DRAIN_WRITEUP_HEADINGS" ]]; then
+    return 0
+  fi
+  local rest=$DRAIN_WRITEUP_HEADINGS
+  local heading esc
+  while [[ -n "$rest" ]]; do
+    if [[ "$rest" == *","* ]]; then
+      heading=${rest%%,*}
+      rest=${rest#*,}
+    else
+      heading=$rest
+      rest=""
+    fi
+    heading=$(trim_ws "$heading")
+    [[ -n "$heading" ]] || continue
+    esc=$(regex_escape "$heading")
+    grep -qiE "^#{1,3}[[:space:]]+${esc}([[:space:]]|$)" <<<"$visible" || return 1
+  done
+  return 0
+}
+
+# Sets CLOSE_OK (0/1), CLOSE_ALREADY (0/1), CLOSE_BLOCKERS (newline list),
+# CLOSE_EVAL_ERROR (0/1). Return 0 if eligible, or already closed *and* the
+# same close-out invariants still hold. Return 1 if close-out conditions
+# are unmet (including an already-closed epic whose descendants/artifacts
+# no longer satisfy the gate). Return 2 on bd/parse infrastructure failure.
+evaluate_epic_close() {
+  local id=$1
+  CLOSE_OK=0
+  CLOSE_ALREADY=0
+  CLOSE_BLOCKERS=""
+  CLOSE_EVAL_ERROR=0
+  local reasons=()
+
+  local show status_row children n close_id close_status already=0
+  local total=0 closed=0 eligible="false" epic_status="" epic_n_ok=1
+  # Pin origin immediately before this evaluation (including the
+  # pre-close re-check and post-close verify). A concurrent push that
+  # removes the write-up or changeset must be visible.
+  if ! refresh_origin_tree; then
+    CLOSE_BLOCKERS="git fetch origin failed"
+    CLOSE_EVAL_ERROR=1
+    log "error: git fetch origin failed; refusing to evaluate close-out from a stale origin/${DEFAULT_BRANCH}"
+    return 2
+  fi
+  show=$(bd_json show "$id") || {
+    CLOSE_BLOCKERS="could not bd show ${id}"
+    CLOSE_EVAL_ERROR=1
+    return 2
+  }
+  if ! epic_status=$(bead_status_from_json "$show"); then
+    CLOSE_BLOCKERS="could not parse status for ${id}"
+    CLOSE_EVAL_ERROR=1
+    return 2
+  fi
+  if [[ "$epic_status" == "closed" ]]; then
+    already=1
+  fi
+
+  n=""
+  local need_n=0
+  if [[ -n "$DRAIN_ID_MAP" || -n "$DRAIN_WRITEUP_GLOB" ]]; then
+    need_n=1
+  fi
+  if [[ "$need_n" -eq 1 ]]; then
+    if ! n=$(epic_number_from_json "$show"); then
+      CLOSE_BLOCKERS="could not parse epic number from title/labels for ${id}"
+      CLOSE_EVAL_ERROR=1
+      return 2
+    fi
+    if [[ -n "$n" ]] && ! epic_number_in_writeup_range "$n"; then
+      local range_txt=""
+      if [[ -n "$DRAIN_WRITEUP_N_MIN" && -n "$DRAIN_WRITEUP_N_MAX" ]]; then
+        range_txt="${DRAIN_WRITEUP_N_MIN}–${DRAIN_WRITEUP_N_MAX}"
+      elif [[ -n "$DRAIN_WRITEUP_N_MIN" ]]; then
+        range_txt=">= ${DRAIN_WRITEUP_N_MIN}"
+      else
+        range_txt="<= ${DRAIN_WRITEUP_N_MAX}"
+      fi
+      reasons+=("epic number ${n} is outside ${range_txt}")
+      epic_n_ok=0
+    fi
+  fi
+  if ! status_row=$(epic_status_row "$id"); then
+    CLOSE_BLOCKERS="could not query bd epic status for ${id}"
+    CLOSE_EVAL_ERROR=1
+    return 2
+  fi
+  if [[ -n "$status_row" ]]; then
+    if ! eligible=$(printf '%s' "$status_row" | jq -er '
+      if has("eligible_for_close") | not then "false"
+      elif .eligible_for_close == true then "true"
+      elif .eligible_for_close == false then "false"
+      else error("bd epic status: eligible_for_close is not a boolean")
+      end
+    '); then
+      CLOSE_BLOCKERS="could not parse eligible_for_close for ${id}"
+      CLOSE_EVAL_ERROR=1
+      return 2
+    fi
+  fi
+  if ! descendants_json "$id"; then
+    CLOSE_BLOCKERS="could not list descendants of ${id}"
+    CLOSE_EVAL_ERROR=1
+    return 2
+  fi
+  children=$DESCENDANTS_JSON
+  # Counts come from the descendant snapshot, not the earlier epic-status
+  # row: a child reopened between those reads must still block close.
+  # Include nested epics/milestones — an open grouping descendant still
+  # means the parent is not fully complete.
+  if ! total=$(printf '%s' "$children" | jq 'length'); then
+    CLOSE_BLOCKERS="could not count descendants of ${id}"
+    CLOSE_EVAL_ERROR=1
+    return 2
+  fi
+  if ! closed=$(printf '%s' "$children" | jq '[.[] | select(.status == "closed")] | length'); then
+    CLOSE_BLOCKERS="could not count closed descendants of ${id}"
+    CLOSE_EVAL_ERROR=1
+    return 2
+  fi
+
+  log "epic ${id}: descendants ${closed}/${total} closed, eligible_for_close=${eligible}"
+
+  if [[ "$total" -eq 0 ]]; then
+    reasons+=("epic has no children")
+  elif [[ "$closed" -ne "$total" ]]; then
+    reasons+=("not all descendants closed (${closed}/${total})")
+  elif [[ "$already" -eq 0 && "$eligible" != "true" ]]; then
+    # bd epic status only lists open epics (status != closed). A closed
+    # epic has no eligibility row, so requiring eligible_for_close here
+    # would reopen every already-closed epic. Descendants and origin
+    # artifacts still apply.
+    reasons+=("bd epic status eligible_for_close is false")
+  fi
+
+  local mapped_close_id map_rc=0
+  mapped_close_id=""
+  if [[ -n "$DRAIN_ID_MAP" && -n "$n" && "$epic_n_ok" -eq 1 ]]; then
+    mapped_close_id=$(close_out_id_for_epic "$n" "$id") || map_rc=$?
+    if [[ "$map_rc" -eq 1 ]]; then
+      CLOSE_BLOCKERS="could not read ${DRAIN_ID_MAP_EPIC_KEY} mapping from origin/${DEFAULT_BRANCH}:${DRAIN_ID_MAP}"
+      CLOSE_EVAL_ERROR=1
+      return 2
+    fi
+    if [[ "$map_rc" -eq 3 ]]; then
+      reasons+=("origin/${DEFAULT_BRANCH} ${DRAIN_ID_MAP} $(expand_n_tokens "$DRAIN_ID_MAP_EPIC_KEY" "$n") is ${mapped_close_id}, not ${id}")
+      mapped_close_id=""
+    elif [[ "$map_rc" -ne 0 ]]; then
+      CLOSE_BLOCKERS="could not read ${DRAIN_ID_MAP_CLOSE_KEY} mapping from origin/${DEFAULT_BRANCH}:${DRAIN_ID_MAP}"
+      CLOSE_EVAL_ERROR=1
+      return 2
+    fi
+  fi
+  close_id=""
+  if [[ -n "$DRAIN_ID_MAP" ]]; then
+    if [[ "$map_rc" -eq 3 ]]; then
+      :
+    elif [[ -n "$mapped_close_id" ]]; then
+      if json_array_has_id "$children" "$mapped_close_id"; then
+        close_id=$mapped_close_id
+      else
+        reasons+=("mapped close-out ${mapped_close_id} is not a descendant of ${id}")
+      fi
+    elif [[ -n "$n" && "$epic_n_ok" -eq 1 ]]; then
+      reasons+=("could not identify close-out child (no origin/${DEFAULT_BRANCH} ${DRAIN_ID_MAP} mapping)")
+    fi
+  fi
+  if [[ -n "$close_id" ]]; then
+    local close_show
+    if ! close_show=$(bd_json show "$close_id"); then
+      CLOSE_BLOCKERS="could not bd show close-out bead ${close_id}"
+      CLOSE_EVAL_ERROR=1
+      return 2
+    fi
+    if ! close_status=$(bead_status_from_json "$close_show"); then
+      CLOSE_BLOCKERS="could not parse status for close-out bead ${close_id}"
+      CLOSE_EVAL_ERROR=1
+      return 2
+    fi
+    log "close-out bead ${close_id}: ${close_status:-unknown}"
+    if [[ "$close_status" != "closed" ]]; then
+      reasons+=("close-out bead ${close_id} is ${close_status:-missing}")
+    fi
+  fi
+
+  if [[ "$need_n" -eq 1 && -z "$n" ]]; then
+    reasons+=("could not parse epic number from title/labels")
+  elif [[ -n "$DRAIN_WRITEUP_GLOB" && "$epic_n_ok" -eq 1 && -n "$n" ]]; then
+    local docs doc ok_doc=0
+    local docs_rc=0
+    docs=$(matching_epic_docs "$n") || docs_rc=$?
+    if [[ "$docs_rc" -ne 0 ]]; then
+      CLOSE_BLOCKERS="could not list origin/${DEFAULT_BRANCH} for epic write-up"
+      CLOSE_EVAL_ERROR=1
+      log "error: could not list origin/${DEFAULT_BRANCH} for epic write-up"
+      return 2
+    fi
+    if [[ -z "$docs" ]]; then
+      reasons+=("missing write-up matching ${DRAIN_WRITEUP_GLOB} for epic ${n} on origin/${DEFAULT_BRANCH}")
+    else
+      while IFS= read -r doc; do
+        [[ -n "$doc" ]] || continue
+        if doc_has_required_headings "$doc"; then
+          log "epic write-up ok: ${doc}"
+          ok_doc=1
+          break
+        fi
+        log "epic write-up incomplete (need ${DRAIN_WRITEUP_HEADINGS:-headings}): ${doc}"
+      done <<<"$docs"
+      if [[ "$ok_doc" -eq 0 ]]; then
+        reasons+=("write-up exists but is missing required headings")
+      fi
+    fi
+  fi
+
+  if [[ -n "$DRAIN_CHANGESET_GLOB" ]]; then
+    local changesets cs_rc=0
+    changesets=$(matching_changesets) || cs_rc=$?
+    if [[ "$cs_rc" -ne 0 ]]; then
+      CLOSE_BLOCKERS="could not list origin/${DEFAULT_BRANCH} for changesets"
+      CLOSE_EVAL_ERROR=1
+      log "error: could not list origin/${DEFAULT_BRANCH} for changesets"
+      return 2
+    fi
+    if [[ -z "$changesets" ]]; then
+      reasons+=("missing ${DRAIN_CHANGESET_GLOB} on origin/${DEFAULT_BRANCH}")
+    else
+      log "changeset present:"
+      printf '%s\n' "$changesets" | sed 's/^/  /'
+    fi
+  fi
+
+  if [[ "$already" -eq 1 ]]; then
+    CLOSE_ALREADY=1
+  fi
+  if [[ ${#reasons[@]} -eq 0 ]]; then
+    CLOSE_OK=1
+    return 0
+  fi
+  CLOSE_BLOCKERS=$(printf '%s\n' "${reasons[@]}")
+  return 1
+}
+
+print_close_evaluation() {
+  local id=$1
+  local would_close
+  # --no-merge skips the close even when CLOSE_OK=1. Dry-run uses this
+  # helper, so the displayed decision must include that option.
+  if [[ "$CLOSE_OK" -eq 1 && "$DO_MERGE" -eq 1 ]]; then
+    would_close=yes
+  elif [[ "$CLOSE_OK" -eq 1 && "$DO_MERGE" -eq 0 ]]; then
+    would_close="no (--no-merge)"
+  else
+    would_close=no
+  fi
+  tee_drain_log <<EOF
+-- epic close evaluation --
+epic:            ${id}
+already closed:  $([[ "$CLOSE_ALREADY" -eq 1 ]] && echo yes || echo no)
+would close:     ${would_close}
+blockers:
+$(if [[ -z "$CLOSE_BLOCKERS" ]]; then echo "  (none)"; else printf '%s\n' "$CLOSE_BLOCKERS" | sed 's/^/  - /'; fi)
+EOF
+}
+
+# Reopen a closed epic (--if-status closed). Return 0 if now open, 2 if
+# the write failed or the post-write re-read did not confirm open.
+reopen_closed_epic() {
+  local id=$1
+  local why=$2
+  local reopen_rc=0
+  log "error: ${why}; reopening ${id}"
+  set +e
+  bd_write_confirm_status open "$id" update "$id" --status open --if-status closed
+  reopen_rc=$?
+  set -e
+  if [[ "$reopen_rc" -eq 0 ]]; then
+    log "reopened epic ${id}"
+    return 0
+  fi
+  log "error: failed to reopen epic ${id}"
+  return 2
+}
+
+# CLOSE_OK=1 and CLOSE_ALREADY=1. Re-run the full close-out gate against a
+# fresh snapshot so a concurrent descendant reopen or origin artifact
+# removal cannot be reported as already closed. Return 0 if still closed
+# and still eligible, 1 if no longer closed (caller continues as open) or
+# after a reopen for unmet gates, 2 on eval/reopen failure.
+accept_already_closed_or_continue() {
+  local id=$1
+  local eval_ec=0 already_ec=0
+  invalidate_descendants_cache
+  evaluate_epic_close "$id" || eval_ec=$?
+  if [[ "${CLOSE_EVAL_ERROR:-0}" -eq 1 || "$eval_ec" -ge 2 ]]; then
+    log "error: could not re-evaluate close-out for already-closed epic ${id}"
+    CLOSE_EVAL_ERROR=1
+    CLOSE_BLOCKERS="could not re-evaluate close-out for already-closed epic ${id}"
+    return 2
+  fi
+  if [[ "$CLOSE_ALREADY" -eq 1 && "$CLOSE_OK" -eq 1 ]]; then
+    log "epic ${id} is already closed"
+    return 0
+  fi
+  print_close_evaluation "$id"
+  if [[ "$CLOSE_ALREADY" -eq 1 ]]; then
+    accept_or_reopen_closed_epic "$id" || already_ec=$?
+    return "$already_ec"
+  fi
+  log "epic ${id} was closed at evaluation but is no longer closed"
+  return 1
+}
+
+# Epic is already closed and close-out is unmet. Reopen (unless dry-run).
+# Return 1 if unmet/reopened, 2 on reopen failure.
+accept_or_reopen_closed_epic() {
+  local id=$1
+  local already_ec=0
+  if [[ "$DRY_RUN" -eq 1 ]]; then
+    log "epic ${id} is closed but close-out conditions are not met"
+    return 1
+  fi
+  reopen_closed_epic "$id" "epic ${id} is closed but close-out conditions are not met" || already_ec=$?
+  if [[ "$already_ec" -ne 0 ]]; then
+    return 2
+  fi
+  return 1
+}
+
+# After a successful bd close, if verification cannot run, CAS-reopen
+# when the epic is still closed so an unverified close does not stick.
+# Logs that manual recovery is required if the reopen also fails.
+recover_unverified_closed_epic() {
+  local id=$1
+  local show st recover_rc=0
+  if ! show=$(bd_json show "$id"); then
+    log "error: epic ${id} remains closed after unverifiable post-close check; could not re-read status (manual recovery required)"
+    CLOSE_BLOCKERS="closed ${id} but could not re-evaluate close-out; reopen failed (manual recovery required)"
+    return 2
+  fi
+  if ! st=$(bead_status_from_json "$show"); then
+    log "error: epic ${id} remains closed after unverifiable post-close check; could not parse status (manual recovery required)"
+    CLOSE_BLOCKERS="closed ${id} but could not re-evaluate close-out; reopen failed (manual recovery required)"
+    return 2
+  fi
+  if [[ "$st" != "closed" ]]; then
+    log "epic ${id} is no longer closed after unverifiable post-close check"
+    return 0
+  fi
+  reopen_closed_epic "$id" "closed ${id} but could not re-evaluate close-out" || recover_rc=$?
+  if [[ "$recover_rc" -ne 0 ]]; then
+    log "error: epic ${id} remains closed after unverifiable post-close check; manual recovery required"
+    CLOSE_BLOCKERS="closed ${id} but could not re-evaluate close-out; reopen failed (manual recovery required)"
+    return 2
+  fi
+  return 0
+}
+
+# bd close is not CAS. After a successful close, re-evaluate the same
+# close-out invariants (epic still closed, descendants, mapped eN-close,
+# write-up, changeset). Reopen and fail if any condition no longer holds.
+verify_closed_epic_descendants() {
+  local id=$1
+  local eval_ec=0 recover_rc=0
+  invalidate_descendants_cache
+  evaluate_epic_close "$id" || eval_ec=$?
+  if [[ "${CLOSE_EVAL_ERROR:-0}" -eq 1 || "$eval_ec" -ge 2 ]]; then
+    log "error: closed epic ${id} but could not re-evaluate close-out"
+    CLOSE_OK=0
+    CLOSE_EVAL_ERROR=1
+    CLOSE_BLOCKERS="closed ${id} but could not re-evaluate close-out"
+    recover_unverified_closed_epic "$id" || recover_rc=$?
+    return 2
+  fi
+  if [[ "$CLOSE_ALREADY" -eq 1 && "$CLOSE_OK" -eq 1 ]]; then
+    return 0
+  fi
+  if [[ "$CLOSE_ALREADY" -ne 1 ]]; then
+    log "error: closed epic ${id} but it is no longer closed"
+    CLOSE_OK=0
+    CLOSE_EVAL_ERROR=1
+    CLOSE_BLOCKERS="closed ${id} but it is no longer closed"
+    return 2
+  fi
+  CLOSE_OK=0
+  CLOSE_EVAL_ERROR=1
+  if [[ -z "$CLOSE_BLOCKERS" ]]; then
+    CLOSE_BLOCKERS="closed ${id} but close-out conditions no longer hold"
+  fi
+  eval_ec=0
+  reopen_closed_epic "$id" "closed ${id} but close-out conditions no longer hold" || eval_ec=$?
+  return 2
+}
+
+try_close_epic() {
+  local id=$1
+  local eval_ec=0 close_rc=0 already_ec=0
+  evaluate_epic_close "$id" || eval_ec=$?
+  print_close_evaluation "$id"
+  if [[ "${CLOSE_EVAL_ERROR:-0}" -eq 1 || "$eval_ec" -ge 2 ]]; then
+    log "error: could not evaluate close-out for epic ${id}"
+    return 2
+  fi
+  if [[ "$CLOSE_ALREADY" -eq 1 ]]; then
+    if [[ "$CLOSE_OK" -ne 1 ]]; then
+      already_ec=0
+      accept_or_reopen_closed_epic "$id" || already_ec=$?
+      return "$already_ec"
+    fi
+    already_ec=0
+    accept_already_closed_or_continue "$id" || already_ec=$?
+    if [[ "$already_ec" -ne 1 ]]; then
+      return "$already_ec"
+    fi
+    # Concurrent reopen: do not report already-closed; re-check as open.
+  fi
+  if [[ "$CLOSE_OK" -ne 1 ]]; then
+    log "leaving epic ${id} open (completion conditions not met)"
+    return 1
+  fi
+  if [[ "$DO_MERGE" -eq 0 ]]; then
+    log "skipping epic close (--no-merge); conditions were met"
+    return 1
+  fi
+  if [[ "$DRY_RUN" -eq 1 ]]; then
+    log "dry-run: would close epic ${id}"
+    return 0
+  fi
+  # bd close is not compare-and-swap. Re-read immediately before the write
+  # so a concurrent reopen, new descendant, or missing artifact cannot ride
+  # the earlier snapshot.
+  invalidate_descendants_cache
+  eval_ec=0
+  evaluate_epic_close "$id" || eval_ec=$?
+  if [[ "${CLOSE_EVAL_ERROR:-0}" -eq 1 || "$eval_ec" -ge 2 ]]; then
+    log "error: could not re-evaluate close-out for epic ${id} immediately before close"
+    return 2
+  fi
+  if [[ "$CLOSE_ALREADY" -eq 1 ]]; then
+    if [[ "$CLOSE_OK" -ne 1 ]]; then
+      already_ec=0
+      accept_or_reopen_closed_epic "$id" || already_ec=$?
+      return "$already_ec"
+    fi
+    already_ec=0
+    accept_already_closed_or_continue "$id" || already_ec=$?
+    if [[ "$already_ec" -ne 1 ]]; then
+      return "$already_ec"
+    fi
+  fi
+  if [[ "$CLOSE_OK" -ne 1 ]]; then
+    print_close_evaluation "$id"
+    log "leaving epic ${id} open (completion conditions no longer met)"
+    return 1
+  fi
+  set +e
+  local close_reason="All children completed; eligible_for_close"
+  if [[ -n "$DRAIN_ID_MAP" || -n "$DRAIN_WRITEUP_GLOB" || -n "$DRAIN_CHANGESET_GLOB" ]]; then
+    close_reason="All children completed; close-out artifacts present"
+  fi
+  bd_write_confirm_status closed "$id" close "$id" --reason "$close_reason"
+  close_rc=$?
+  set -e
+  if [[ "$close_rc" -eq 0 ]]; then
+    if ! verify_closed_epic_descendants "$id"; then
+      return 2
+    fi
+    # verify re-runs evaluate_epic_close, which sets CLOSE_ALREADY=1
+    # because the epic is now closed. This invocation performed the
+    # close; interpret_close_attempt must report "closed", not
+    # "already closed".
+    CLOSE_ALREADY=0
+    log "closed epic ${id}"
+    return 0
+  fi
+  if [[ "$close_rc" -eq 2 ]]; then
+    log "error: bd close JSON unusable for ${id} and could not confirm closed"
+    return 2
+  fi
+  log "error: bd close failed for epic ${id}"
+  return 1
+}
+
+print_drain_summary() {
+  local epic=$1
+  local beads_run=$2
+  local epic_close=$3
+  local ready_count="(query failed)" ready_json
+  if ready_json=$(fetch_ready_json); then
+    ready_count=$(ready_count_from_json "$ready_json" 2>/dev/null || echo "(query failed)")
+  fi
+  tee_drain_log <<EOF
+
+======== bead-cycle drain summary ========
+epic:            ${epic}
+beads this run:  ${beads_run}
+epic close:      ${epic_close}
+next ready:      ${ready_count}
+log:             ${DRAIN_LOG:-none}
+==========================================
+EOF
+}
+
+print_drain_dry_run() {
+  local id=$1
+  local children ready resume_id resume_list eval_ec=0
+  local ready_ids open_txt ready_txt selected
+  if ! descendants_json "$id"; then
+    log "error: failed to list descendants of ${id}"
+    return 1
+  fi
+  if ! ready=$(fetch_ready_json); then
+    log "error: failed to list ready beads for drain dry-run"
+    return 1
+  fi
+  if ! ready_ids=$(non_epic_ids_from_ready "$ready"); then
+    log "error: failed to parse ready beads for drain dry-run"
+    return 1
+  fi
+  resume_id=""
+  if ! resume_list=$(ranked_resume_ids); then
+    log "error: failed to list in-progress beads for drain dry-run"
+    return 1
+  fi
+  # first_implementable_* run in command substitutions. `die` from
+  # load_known_issue_types would exit only that subshell, so a `bd types`
+  # failure must be raised in this shell before either selector.
+  load_known_issue_types
+  # Same type/known/status filter as the real resume path — do not report
+  # an epic, milestone, or unknown-type id as `resume`.
+  if ! resume_id=$(first_implementable_resume_id "$resume_list"); then
+    log "error: failed to inspect in-progress beads for drain dry-run"
+    return 1
+  fi
+  # Same ready walk as claim_or_select_ready (select mode). Resume wins,
+  # matching select_and_claim_bead.
+  selected=""
+  if [[ -n "$resume_id" ]]; then
+    selected=$resume_id
+  elif ! selected=$(first_implementable_ready_id "$ready_ids"); then
+    log "error: failed to inspect ready beads for drain dry-run"
+    return 1
+  fi
+  if ! ready_txt=$(printf '%s' "$ready" | jq -r "${jq_bd_preamble}"'
+      ready_issues
+      | if length == 0 then "  (none)"
+        else
+          .[]
+          | require_id("bd ready") as $id
+          | optional_string_field("title") as $title
+          | "  - \($id)  \($title)"
+        end
+    '); then
+    log "error: failed to render ready beads for drain dry-run"
+    return 1
+  fi
+  # Close-out must not reuse the descendant snapshot from the start of
+  # this function: ready/resume queries can race with a child status
+  # change. Invalidate, evaluate, then render open children from that
+  # same reloaded snapshot.
+  invalidate_descendants_cache
+  evaluate_epic_close "$id" || eval_ec=$?
+  children=${DESCENDANTS_JSON:-}
+  if [[ -z "$children" ]]; then
+    open_txt="  (unavailable)"
+  elif ! open_txt=$(printf '%s' "$children" | jq -r '
+      [.[]
+        | select(.status != "closed")
+        | "  - \(.id)  \(.status)  \(.title // "")"]
+      | if length == 0 then "  (none)" else .[] end
+    '); then
+    log "error: failed to render open descendants for drain dry-run"
+    return 1
+  fi
+  cat <<EOF
+== dry-run drain ==
+epic:        ${id}
+resume:      ${resume_id:-none}
+selected:    ${selected:-none}
+open children:
+${open_txt}
+next ready:
+${ready_txt}
+$(print_close_evaluation "$id")
+EOF
+  if [[ "${CLOSE_EVAL_ERROR:-0}" -eq 1 || "$eval_ec" -ge 2 ]]; then
+    log "error: could not evaluate close-out for epic ${id}"
+    return 1
+  fi
+  return 0
+}
+
+resolve_scope_from_arg() {
+  if [[ -z "$BEAD_ID" ]]; then
+    if [[ "$DRAIN" -eq 1 ]]; then
+      die "--drain requires an epic id (got nothing)"
+    fi
+    return 0
+  fi
+  local itype
+  SHOW_JSON=$(bd_json show "$BEAD_ID") || die "bead not found: $BEAD_ID"
+  if ! itype=$(bead_type_from_json "$SHOW_JSON"); then
+    die "cannot parse issue_type for ${BEAD_ID}; refusing to claim (fail closed)"
+  fi
+  if ! BEAD_STATUS=$(bead_status_from_json "$SHOW_JSON"); then
+    die "failed to parse status for ${BEAD_ID}"
+  fi
+  if [[ "$itype" == "epic" ]]; then
+    SCOPE_ID=$BEAD_ID
+    log "scoping to epic ${SCOPE_ID}; children only"
+    BEAD_ID=""
+    BEAD_STATUS=""
+    return 0
+  fi
+  if [[ "$itype" == "milestone" ]]; then
+    if [[ "$DRAIN" -eq 1 ]]; then
+      die "--drain requires an epic (got milestone ${BEAD_ID})"
+    fi
+    SCOPE_ID=$BEAD_ID
+    log "scoping to milestone ${SCOPE_ID}; children only"
+    BEAD_ID=""
+    BEAD_STATUS=""
+    return 0
+  fi
+  if [[ "$DRAIN" -eq 1 ]]; then
+    die "--drain requires an epic id, not ${BEAD_ID}"
+  fi
+}
+
+select_and_claim_bead() {
+  SKIP_RUN=0
+  RESUMING=0
+  BEAD_STATUS=""
+
+  if [[ -n "$BEAD_ID" ]]; then
+    SHOW_JSON=$(bd_json show "$BEAD_ID") || die "bead not found: $BEAD_ID"
+    refuse_if_not_implementable "$BEAD_ID" "$SHOW_JSON"
+    if ! BEAD_STATUS=$(bead_status_from_json "$SHOW_JSON"); then
+      die "failed to parse status for ${BEAD_ID}"
+    fi
+    if [[ "$BEAD_STATUS" == "closed" ]]; then
+      inspect_bead_progress "$BEAD_ID"
+      if [[ "$PR_STATE" == "merged" ]]; then
+        log "bead ${BEAD_ID} is already closed (PR ${PR_URL})"
+      else
+        log "bead ${BEAD_ID} is already closed"
+      fi
+      LOG_FILE=$(cycle_log_path "$BEAD_ID")
+      print_summary "$BEAD_ID" "${PR_URL:-}" "n/a" "0" "already closed"
+      SKIP_RUN=1
+      return 0
+    fi
+    if [[ "$BEAD_STATUS" == "in_progress" ]]; then
+      RESUMING=1
+    fi
+    if [[ "$DRY_RUN" -eq 1 ]]; then
+      log "dry-run: would $([[ "$RESUMING" -eq 1 ]] && echo resume || echo claim) ${BEAD_ID} (status=${BEAD_STATUS})"
+    else
+      if [[ "$RESUMING" -eq 1 ]]; then
+        log "resuming ${BEAD_ID} (already in_progress)"
+      elif ! claim_bead "$BEAD_ID"; then
+        die "failed to claim ${BEAD_ID} (status=${BEAD_STATUS})"
+      else
+        local claimed_type
+        if ! claimed_type=$(bead_type_from_json "$CLAIM_JSON"); then
+          unclaim_refused "$BEAD_ID"
+          die "failed to parse issue_type after claim of ${BEAD_ID}"
+        fi
+        if [[ -z "$claimed_type" ]] || is_grouping_type "$claimed_type"; then
+          unclaim_refused "$BEAD_ID"
+          die "refusing to implement ${BEAD_ID} after claim (type=${claimed_type:-unknown})"
+        fi
+        if ! is_known_issue_type "$claimed_type"; then
+          unclaim_refused "$BEAD_ID"
+          die "refusing to implement ${BEAD_ID} after claim (type=${claimed_type} not in bd types)"
+        fi
+        log "claimed ${BEAD_ID}"
+      fi
+    fi
+    return 0
+  fi
+
+  local resume_list picked resume_type
+  resume_list=""
+  if ! resume_list=$(ranked_resume_ids); then
+    die "failed to list in-progress beads; not claiming a new item"
+  fi
+  while IFS= read -r picked; do
+    [[ -n "$picked" ]] || continue
+    if ! SHOW_JSON=$(bd_json show "$picked"); then
+      die "failed to inspect in-progress bead ${picked} (bd show error); not claiming a new item"
+    fi
+    if ! BEAD_STATUS=$(bead_status_from_json "$SHOW_JSON"); then
+      die "failed to parse status for in-progress ${picked}"
+    fi
+    if ! resume_type=$(bead_type_from_json "$SHOW_JSON"); then
+      die "failed to parse issue_type for in-progress ${picked}"
+    fi
+    if [[ -z "$resume_type" ]] || is_grouping_type "$resume_type"; then
+      log "skipping resume of ${picked} (type=${resume_type:-unknown})"
+      continue
+    fi
+    if ! is_known_issue_type "$resume_type"; then
+      log "skipping resume of ${picked} (type=${resume_type} not in bd types)"
+      continue
+    fi
+    if [[ "$BEAD_STATUS" != "in_progress" ]]; then
+      log "skipping resume of ${picked} (status=${BEAD_STATUS:-unknown}; no longer in_progress)"
+      continue
+    fi
+    BEAD_ID=$picked
+    RESUMING=1
+    log "resuming in-progress ${BEAD_ID}${SCOPE_ID:+ (epic ${SCOPE_ID})}"
+    return 0
+  done <<< "$resume_list"
+
+  READY_JSON=$(fetch_ready_json) || die "failed to list ready beads"
+  if [[ -z "$READY_JSON" || "$READY_JSON" == "[]" ]]; then
+    maybe_queue_empty
+    return 3
+  fi
+  if [[ "$DRY_RUN" -eq 1 ]]; then
+    claim_or_select_ready select || return
+  else
+    claim_or_select_ready claim || return
+  fi
+}
+
+run_one_bead() {
+  local cycle_ec=0 close_rc=0
+  LOG_FILE=$(cycle_log_path "$BEAD_ID")
+  if [[ "$DRY_RUN" -eq 0 ]]; then
+    # drain_epic invokes this as `run_one_bead || ...`, which disables
+    # errexit. A failed log create/header write must not continue into
+    # Grok/API work without a usable recovery log.
+    if ! : >>"$LOG_FILE"; then
+      log "error: could not initialize bead log ${LOG_FILE}"
+      return 1
+    fi
+    local msg
+    msg="==== $(now_stamp) bead=${BEAD_ID} epic=${SCOPE_ID:-} resume=${RESUMING} drain=${DRAIN} ===="
+    if ! printf '%s\n' "$msg" >>"$LOG_FILE"; then
+      log "error: could not write bead log header ${LOG_FILE}"
+      return 1
+    fi
+    log "$msg"
+  fi
+
+  inspect_bead_progress "$BEAD_ID"
+  configure_grok_cwd
+
+  if [[ "$RESUMING" -eq 1 && "$DRY_RUN" -eq 0 ]]; then
+    bd_json heartbeat "$BEAD_ID" >/dev/null 2>&1 \
+      || log "warning: bd heartbeat failed for ${BEAD_ID}; continuing"
+  fi
+
+  if [[ "$DRY_RUN" -eq 1 ]]; then
+    cat <<EOF
+== dry-run ==
+bead:        ${BEAD_ID}
+epic scope:  ${SCOPE_ID:-none}
+resume:      $([[ "$RESUMING" -eq 1 ]] && echo yes || echo no)
+stage:       ${STAGE}
+pr:          ${PR_STATE}${PR_URL:+ ${PR_URL} (#${PR_NUMBER})}
+branch:      ${FEAT_BRANCH:-none}
+worktree:    ${WORKTREE_PATH:-none}
+grok cwd:    ${GROK_CWD}
+new worktree:$([[ "$CREATE_WORKTREE" -eq 1 ]] && echo "bead-${BEAD_ID}" || echo no)
+max-turns:   ${MAX_TURNS}
+max-rounds:  ${MAX_ROUNDS}
+merge:       $([[ "$DO_MERGE" -eq 1 ]] && echo yes || echo no)
+drain:       $([[ "$DRAIN" -eq 1 ]] && echo yes || echo no)
+
+--- implement prompt ---
+$(implement_prompt "$BEAD_ID")
+EOF
+    return 0
+  fi
+
+  if [[ "$STAGE" == "close" ]]; then
+    log "PR already merged (${PR_URL}); closing ${BEAD_ID}"
+    set +e
+    bd_write_confirm_status closed "$BEAD_ID" close "$BEAD_ID" --reason "Merged via PR #${PR_NUMBER}"
+    close_rc=$?
+    set -e
+    if [[ "$close_rc" -eq 0 ]]; then
+      print_summary "$BEAD_ID" "$PR_URL" "n/a (already merged)" "0" "closed"
+      return 0
+    fi
+    log "warning: bd close failed; bead may already be closed"
+    print_summary "$BEAD_ID" "$PR_URL" "n/a (already merged)" "0" "merge recorded, close failed"
+    if [[ "$DRAIN" -eq 1 ]]; then
+      return 1
+    fi
+    return 0
+  fi
+
+  # drain_epic invokes this as `run_one_bead || ...`, which disables
+  # errexit. A failed mktemp must not continue with an empty OUT_FILE.
+  if ! OUT_FILE=$(cycle_mktemp "bead-cycle-out"); then
+    log "error: could not create temp file for Grok output"
+    return 1
+  fi
+  trap 'rm -f "$OUT_FILE"' EXIT
+
+  if [[ "$STAGE" == "nurse" ]]; then
+    log "open PR already exists (#${PR_NUMBER}); skipping implement"
+  else
+    log "==> implement ${BEAD_ID}"
+    IMPLEMENT_EC=0
+    run_grok "$(implement_prompt "$BEAD_ID")" "$OUT_FILE" || IMPLEMENT_EC=$?
+
+    RESULT_JSON=$(extract_result_json "$OUT_FILE" || true)
+    if DISCOVERED=$(discover_pr "$BEAD_ID" "$RESULT_JSON"); then
+      apply_discovered_pr "$DISCOVERED"
+    fi
+
+    if [[ -z "$PR_NUMBER" || "$PR_STATE" != "open" ]]; then
+      print_summary "$BEAD_ID" "${PR_URL:-}" "no PR" "0" "not attempted"
+      log "error: Grok finished without an open PR for ${BEAD_ID} (grok exit ${IMPLEMENT_EC})"
+      rm -f "$OUT_FILE"
+      return 1
+    fi
+  fi
+
+  log "PR #${PR_NUMBER} ${PR_URL}"
+
+  if ! REVIEWS=$(copilot_reviews_json "$PR_NUMBER"); then
+    print_summary "$BEAD_ID" "$PR_URL" "failed to list Copilot reviews" "0" "not attempted"
+    log "error: failed to list Copilot reviews on PR #${PR_NUMBER}"
+    rm -f "$OUT_FILE"
+    return 1
+  fi
+  if ! REVIEW_COUNT=$(printf '%s' "$REVIEWS" | jq 'length'); then
+    print_summary "$BEAD_ID" "$PR_URL" "failed to parse Copilot reviews" "0" "not attempted"
+    log "error: failed to parse Copilot reviews on PR #${PR_NUMBER}"
+    rm -f "$OUT_FILE"
+    return 1
+  fi
+  [[ "$REVIEW_COUNT" =~ ^[0-9]+$ ]] || {
+    print_summary "$BEAD_ID" "$PR_URL" "failed to parse Copilot reviews" "0" "not attempted"
+    log "error: Copilot review count is not an integer"
+    rm -f "$OUT_FILE"
+    return 1
+  }
+  if [[ "$STAGE" == "nurse" && "$REVIEW_COUNT" -gt 0 ]]; then
+    log "Copilot already has ${REVIEW_COUNT} review(s); not re-requesting before first wait"
+  else
+    request_copilot_review "$PR_NUMBER" || log "warning: could not request Copilot review"
+  fi
+
+  ROUNDS_USED=0
+  COPILOT_STATUS="unknown"
+  MERGE_STATUS="not attempted"
+  PREV_IDS=""
+  LAST_REVIEW_ID=""
+  FIRST_REVIEW=1
+
+  while true; do
+    log "==> wait for Copilot on PR #${PR_NUMBER}"
+    REVIEW=$(wait_for_copilot_review "$PR_NUMBER" "$LAST_REVIEW_ID") \
+      || { print_summary "$BEAD_ID" "$PR_URL" "no Copilot review" "$ROUNDS_USED" "$MERGE_STATUS"
+           log "error: no Copilot review appeared on PR #${PR_NUMBER} within ${REVIEW_TIMEOUT}s"
+           rm -f "$OUT_FILE"
+           return 1; }
+
+    if ! LAST_REVIEW_ID=$(printf '%s' "$REVIEW" | jq -r '.id // empty'); then
+      print_summary "$BEAD_ID" "$PR_URL" "failed to parse Copilot review" "$ROUNDS_USED" "$MERGE_STATUS"
+      log "error: failed to parse Copilot review id on PR #${PR_NUMBER}"
+      rm -f "$OUT_FILE"
+      return 1
+    fi
+    if [[ -z "$LAST_REVIEW_ID" ]]; then
+      print_summary "$BEAD_ID" "$PR_URL" "failed to parse Copilot review" "$ROUNDS_USED" "$MERGE_STATUS"
+      log "error: Copilot review missing id on PR #${PR_NUMBER}"
+      rm -f "$OUT_FILE"
+      return 1
+    fi
+    if ! REVIEW_STATE=$(printf '%s' "$REVIEW" | jq -r '.state // empty'); then
+      print_summary "$BEAD_ID" "$PR_URL" "failed to parse Copilot review" "$ROUNDS_USED" "$MERGE_STATUS"
+      log "error: failed to parse Copilot review state on PR #${PR_NUMBER}"
+      rm -f "$OUT_FILE"
+      return 1
+    fi
+    if ! REVIEW_BODY=$(printf '%s' "$REVIEW" | jq -r '.body // empty'); then
+      print_summary "$BEAD_ID" "$PR_URL" "failed to parse Copilot review" "$ROUNDS_USED" "$MERGE_STATUS"
+      log "error: failed to parse Copilot review body on PR #${PR_NUMBER}"
+      rm -f "$OUT_FILE"
+      return 1
+    fi
+    if ! THREADS=$(copilot_unresolved_threads "$PR_NUMBER"); then
+      print_summary "$BEAD_ID" "$PR_URL" "failed to list Copilot threads" "$ROUNDS_USED" "$MERGE_STATUS"
+      log "error: failed to list Copilot threads on PR #${PR_NUMBER}"
+      rm -f "$OUT_FILE"
+      return 1
+    fi
+    printf '%s' "$THREADS" | jq -e 'type == "array"' >/dev/null || {
+      print_summary "$BEAD_ID" "$PR_URL" "failed to parse Copilot threads" "$ROUNDS_USED" "$MERGE_STATUS"
+      log "error: Copilot threads JSON is not an array on PR #${PR_NUMBER}"
+      rm -f "$OUT_FILE"
+      return 1
+    }
+    if ! IDS=$(thread_id_set "$THREADS"); then
+      print_summary "$BEAD_ID" "$PR_URL" "failed to collect Copilot thread ids" "$ROUNDS_USED" "$MERGE_STATUS"
+      log "error: failed to collect Copilot thread ids on PR #${PR_NUMBER}"
+      rm -f "$OUT_FILE"
+      return 1
+    fi
+    if ! COUNT=$(printf '%s' "$THREADS" | jq 'length'); then
+      print_summary "$BEAD_ID" "$PR_URL" "failed to parse Copilot threads" "$ROUNDS_USED" "$MERGE_STATUS"
+      log "error: failed to count Copilot threads on PR #${PR_NUMBER}"
+      rm -f "$OUT_FILE"
+      return 1
+    fi
+    [[ "$COUNT" =~ ^[0-9]+$ ]] || {
+      print_summary "$BEAD_ID" "$PR_URL" "failed to parse Copilot threads" "$ROUNDS_USED" "$MERGE_STATUS"
+      log "error: Copilot thread count is not an integer on PR #${PR_NUMBER}"
+      rm -f "$OUT_FILE"
+      return 1
+    }
+
+    log "Copilot review ${LAST_REVIEW_ID} state=${REVIEW_STATE} unresolved=${COUNT}"
+
+    if review_is_approval "$REVIEW_STATE" "$REVIEW_BODY"; then
+      COPILOT_STATUS="approved"
+      break
+    fi
+    if [[ "$COUNT" -eq 0 ]]; then
+      COPILOT_STATUS="no unresolved comments"
+      break
+    fi
+    if [[ "$FIRST_REVIEW" -eq 0 && "$IDS" == "$PREV_IDS" ]]; then
+      COPILOT_STATUS="no new unresolved comments"
+      break
+    fi
+    if (( ROUNDS_USED >= MAX_ROUNDS )); then
+      COPILOT_STATUS="still blocking (round cap)"
+      log "unresolved Copilot threads:"
+      printf '%s' "$THREADS" | jq -r '.[] | "- \(.path): \(.url)\n  \(.body | split("\n")[0])"'
+      print_summary "$BEAD_ID" "$PR_URL" "$COPILOT_STATUS" "$ROUNDS_USED" "$MERGE_STATUS"
+      rm -f "$OUT_FILE"
+      return 2
+    fi
+
+    ROUNDS_USED=$((ROUNDS_USED + 1))
+    log "==> fix round ${ROUNDS_USED}/${MAX_ROUNDS}"
+    FIX_EC=0
+    run_grok "$(fix_prompt "$BEAD_ID" "$PR_NUMBER" "$PR_URL" "$ROUNDS_USED")" "$OUT_FILE" || FIX_EC=$?
+    if [[ "$FIX_EC" -ne 0 ]]; then
+      log "warning: Grok fix session exited ${FIX_EC}; continuing to re-request Copilot"
+    fi
+    request_copilot_review "$PR_NUMBER" || log "warning: could not re-request Copilot review"
+    PREV_IDS=$IDS
+    FIRST_REVIEW=0
+  done
+
+  if [[ "$DO_MERGE" -eq 1 ]]; then
+    log "==> wait for CI then merge"
+    if ! wait_for_ci "$PR_NUMBER"; then
+      MERGE_STATUS="blocked: CI red"
+      print_summary "$BEAD_ID" "$PR_URL" "$COPILOT_STATUS" "$ROUNDS_USED" "$MERGE_STATUS"
+      rm -f "$OUT_FILE"
+      return 1
+    fi
+    if merge_pr "$PR_NUMBER"; then
+      if wait_for_pr_merged "$PR_NUMBER"; then
+        MERGE_STATUS="merged"
+        set +e
+        bd_write_confirm_status closed "$BEAD_ID" close "$BEAD_ID" --reason "Merged via PR #${PR_NUMBER}"
+        close_rc=$?
+        set -e
+        if [[ "$close_rc" -eq 0 ]]; then
+          MERGE_STATUS="merged and closed"
+        else
+          log "warning: merged but bd close failed"
+          MERGE_STATUS="merged, close failed"
+          cycle_ec=1
+        fi
+      else
+        MERGE_STATUS="blocked: merge not completed"
+        log "merge command succeeded but PR #${PR_NUMBER} is not merged; leaving ${BEAD_ID} in progress"
+        cycle_ec=1
+      fi
+    else
+      MERGE_STATUS="blocked: merge not allowed"
+      log "merge blocked; leaving ${BEAD_ID} in progress"
+      cycle_ec=1
+    fi
+  else
+    MERGE_STATUS="skipped (--no-merge)"
+  fi
+
+  print_summary "$BEAD_ID" "$PR_URL" "$COPILOT_STATUS" "$ROUNDS_USED" "$MERGE_STATUS"
+  rm -f "$OUT_FILE"
+
+  if [[ "$DRAIN" -eq 1 && "$MERGE_STATUS" != "merged and closed" && "$MERGE_STATUS" != "closed" ]]; then
+    local st
+    st=$(bead_status_from_json "$(bd_json show "$BEAD_ID")") || st=""
+    if [[ "$st" != "closed" ]]; then
+      log "drain cannot continue: ${BEAD_ID} is ${st:-unknown} (${MERGE_STATUS})"
+      return 1
+    fi
+  fi
+  return "$cycle_ec"
+}
+
+# Interpret try_close_epic's exit. Sets DRAIN_EPIC_CLOSE.
+# Return 0: drain exits success. 1: drain hard-fails. 3: not closed; caller
+# decides from remaining open children (queue-empty vs max-beads).
+interpret_close_attempt() {
+  local close_ec=$1
+  if [[ "$close_ec" -eq 0 ]]; then
+    if [[ "$CLOSE_ALREADY" -eq 1 ]]; then
+      DRAIN_EPIC_CLOSE="already closed"
+    else
+      DRAIN_EPIC_CLOSE="closed"
+    fi
+    return 0
+  fi
+  if [[ "$close_ec" -ge 2 || "${CLOSE_EVAL_ERROR:-0}" -eq 1 ]]; then
+    DRAIN_EPIC_CLOSE="stopped (close evaluation failed)"
+    return 1
+  fi
+  if [[ "$CLOSE_OK" -eq 1 ]]; then
+    if [[ "$DO_MERGE" -eq 0 ]]; then
+      DRAIN_EPIC_CLOSE="not closed (--no-merge)"
+      return 0
+    fi
+    DRAIN_EPIC_CLOSE="not closed (bd close failed)"
+    return 1
+  fi
+  return 3
+}
+
+# 0 if a ready or in-progress candidate would be selected (known
+# non-grouping type). 1 if none remain. 2 on show/list/parse failure.
+# Mirrors claim/resume skip policy: unknown and grouping are not
+# implementable remaining work.
+has_implementable_remaining() {
+  local ready_json ready_ids resume_list candidate show itype st
+  if ! ready_json=$(fetch_ready_json); then
+    return 2
+  fi
+  if ! ready_ids=$(non_epic_ids_from_ready "$ready_json"); then
+    return 2
+  fi
+  while IFS= read -r candidate; do
+    [[ -n "$candidate" ]] || continue
+    if ! show=$(bd_json show "$candidate"); then
+      return 2
+    fi
+    if ! st=$(bead_status_from_json "$show"); then
+      return 2
+    fi
+    : "$st"
+    if ! itype=$(bead_type_from_json "$show"); then
+      return 2
+    fi
+    if [[ -z "$itype" ]] || is_grouping_type "$itype"; then
+      continue
+    fi
+    if ! is_known_issue_type "$itype"; then
+      continue
+    fi
+    return 0
+  done <<< "$ready_ids"
+
+  if ! resume_list=$(ranked_resume_ids); then
+    return 2
+  fi
+  while IFS= read -r candidate; do
+    [[ -n "$candidate" ]] || continue
+    if ! show=$(bd_json show "$candidate"); then
+      return 2
+    fi
+    if ! st=$(bead_status_from_json "$show"); then
+      return 2
+    fi
+    if ! itype=$(bead_type_from_json "$show"); then
+      return 2
+    fi
+    if [[ -z "$itype" ]] || is_grouping_type "$itype"; then
+      continue
+    fi
+    if ! is_known_issue_type "$itype"; then
+      continue
+    fi
+    if [[ "$st" != "in_progress" ]]; then
+      continue
+    fi
+    return 0
+  done <<< "$resume_list"
+  return 1
+}
+
+# After try_close_epic. fallback is "queue_empty" or "max_beads".
+drain_end_after_close_attempt() {
+  local id=$1
+  local completed=$2
+  local fallback=$3
+  local close_ec=${4:-0}
+  local ic=0 children open_n
+  interpret_close_attempt "$close_ec" || ic=$?
+  if [[ "$ic" -ne 3 ]]; then
+    print_drain_summary "$id" "$completed" "$DRAIN_EPIC_CLOSE"
+    return "$ic"
+  fi
+  # try_close_epic populated DESCENDANTS_CACHE_* during the unmet
+  # evaluation. If an open child closes or becomes ready after that
+  # snapshot, descendants_json would reuse it and drain could report
+  # queue-empty success without retrying close. Invalidate, re-run the
+  # close decision, then count opens from that refreshed snapshot.
+  invalidate_descendants_cache
+  close_ec=0
+  try_close_epic "$id" || close_ec=$?
+  ic=0
+  interpret_close_attempt "$close_ec" || ic=$?
+  if [[ "$ic" -ne 3 ]]; then
+    print_drain_summary "$id" "$completed" "$DRAIN_EPIC_CLOSE"
+    return "$ic"
+  fi
+  if ! descendants_json "$id"; then
+    print_drain_summary "$id" "$completed" "stopped (could not list descendants)"
+    return 1
+  fi
+  children=$DESCENDANTS_JSON
+  if ! open_n=$(printf '%s' "$children" | jq '[.[] | select(.status != "closed")] | length'); then
+    print_drain_summary "$id" "$completed" "stopped (could not count open descendants)"
+    return 1
+  fi
+  if [[ "$open_n" == "0" ]]; then
+    print_drain_summary "$id" "$completed" "not closed (close-out conditions unmet)"
+    return 1
+  fi
+  if [[ "$fallback" == "max_beads" ]]; then
+    print_drain_summary "$id" "$completed" "stopped (hit --max-beads ${MAX_BEADS})"
+    log "error: hit --max-beads ${MAX_BEADS} without finishing epic ${id}"
+    return 1
+  fi
+  print_drain_summary "$id" "$completed" "not closed (${open_n} children still open / not ready)"
+  return 0
+}
+
+drain_epic() {
+  local id=$1
+  local completed=0
+  local last_ec=0
+  local close_ec=0
+  local fallback impl_ec
+  if [[ "$DRY_RUN" -eq 1 ]]; then
+    DRAIN_LOG=""
+    print_drain_dry_run "$id" || return 1
+    return 0
+  fi
+
+  DRAIN_LOG=$(cycle_log_path "$id")
+  : >>"$DRAIN_LOG"
+  log "==== $(now_stamp) drain epic=${id} max-beads=${MAX_BEADS} ===="
+
+  while (( completed < MAX_BEADS )); do
+    invalidate_descendants_cache
+    BEAD_ID=""
+    SKIP_RUN=0
+    last_ec=0
+    select_and_claim_bead || last_ec=$?
+    if [[ "$last_ec" -ne 0 ]]; then
+      if [[ "$last_ec" -eq 3 ]]; then
+        invalidate_descendants_cache
+        close_ec=0
+        try_close_epic "$id" || close_ec=$?
+        last_ec=0
+        drain_end_after_close_attempt "$id" "$completed" "queue_empty" "$close_ec" || last_ec=$?
+        return "$last_ec"
+      fi
+      print_drain_summary "$id" "$completed" "stopped (select failed)"
+      return "$last_ec"
+    fi
+
+    if [[ "$SKIP_RUN" -eq 1 ]]; then
+      completed=$((completed + 1))
+      continue
+    fi
+
+    last_ec=0
+    run_one_bead || last_ec=$?
+    completed=$((completed + 1))
+    if [[ "$last_ec" -ne 0 ]]; then
+      log "drain stopped after ${BEAD_ID} (exit ${last_ec})"
+      print_drain_summary "$id" "$completed" "stopped (${BEAD_ID} failed)"
+      return "$last_ec"
+    fi
+    sync_git
+  done
+
+  invalidate_descendants_cache
+  close_ec=0
+  try_close_epic "$id" || close_ec=$?
+  last_ec=0
+  # Successful close (or close-eval error) must not be overwritten by a
+  # later ready/in-progress probe failure.
+  if [[ "$close_ec" -eq 0 || "$close_ec" -ge 2 || "${CLOSE_EVAL_ERROR:-0}" -eq 1 ]]; then
+    drain_end_after_close_attempt "$id" "$completed" "queue_empty" "$close_ec" || last_ec=$?
+    return "$last_ec"
+  fi
+  # Cap hit is only an error if implementable ready/in-progress work
+  # remains. Unknown/grouping candidates follow the skip/queue-empty path.
+  # try_close_epic populated DESCENDANTS_CACHE_* during the close gate.
+  # has_implementable_remaining → ranked_resume_ids → in_progress_ids
+  # would reuse that snapshot and miss a child that became in_progress
+  # after close evaluation. Drain would then report queue-empty success
+  # with work left to resume. Invalidate here so the remaining-work
+  # probe and drain_end's open-count share a refreshed snapshot.
+  fallback="max_beads"
+  impl_ec=0
+  invalidate_descendants_cache
+  has_implementable_remaining || impl_ec=$?
+  if [[ "$impl_ec" -ge 2 ]]; then
+    print_drain_summary "$id" "$completed" "stopped (could not inspect remaining work)"
+    return 1
+  fi
+  if [[ "$impl_ec" -ne 0 ]]; then
+    fallback="queue_empty"
+  fi
+  drain_end_after_close_attempt "$id" "$completed" "$fallback" "$close_ec" || last_ec=$?
+  return "$last_ec"
+}
+
+# --- main ---
+
+preflight
+load_repo_info
+
+if [[ "$DRY_RUN" -eq 0 ]]; then
+  sync_git
+fi
+
+RESUMING=0
+BEAD_STATUS=""
+resolve_scope_from_arg
+
+if [[ "$DRAIN" -eq 1 ]]; then
+  if [[ -z "$SCOPE_ID" ]]; then
+    die "--drain requires an epic id (got ${BEAD_ID:-nothing})"
+  fi
+  SHOW_JSON=$(bd_json show "$SCOPE_ID") || die "bead not found: $SCOPE_ID"
+  drain_scope_type=""
+  if ! drain_scope_type=$(bead_type_from_json "$SHOW_JSON"); then
+    die "cannot parse issue_type for ${SCOPE_ID}"
+  fi
+  if [[ "$drain_scope_type" != "epic" ]]; then
+    die "--drain requires an epic (got ${drain_scope_type:-unknown} ${SCOPE_ID})"
+  fi
+  drain_epic "$SCOPE_ID"
+  exit $?
+fi
+
+select_ec=0
+select_and_claim_bead || select_ec=$?
+if [[ "$select_ec" -ne 0 ]]; then
+  exit "$select_ec"
+fi
+if [[ "$SKIP_RUN" -eq 1 ]]; then
+  exit 0
+fi
+
+# Do not invoke as `run_one_bead || ...` here: that disables errexit inside
+# the function. Drain still uses `||` to print a summary, so run_one_bead
+# also checks review/merge command results explicitly.
+run_one_bead
+exit $?
