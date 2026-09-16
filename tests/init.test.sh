@@ -519,6 +519,22 @@ test_force_replaces_symlink() {
   rm -f "$ext"
 }
 
+# Empty prefix writes BEAD_CYCLE_BRANCH_PREFIX=; bead-cycle then uses feat/.
+test_empty_branch_prefix_no_writes() {
+  local tmp
+  tmp=$(mktemp -d)
+  make_repo "$tmp"
+  if BEAD_CYCLE_BRANCH_PREFIX= \
+    bash "$INIT" --yes --dir "$tmp" --create-beads >/dev/null 2>&1; then
+    rm -rf "$tmp"
+    printf 'expected empty branch prefix to fail\n' >&2
+    return 1
+  fi
+  assert test ! -e "$tmp/.beads"
+  assert test ! -e "$tmp/scripts"
+  rm -rf "$tmp"
+}
+
 # Reversed write-up bounds match no epic in bead-cycle. Reject before writes.
 test_reversed_drain_writeup_range_no_writes() {
   local tmp
@@ -583,6 +599,7 @@ run_test test_bd_init_yes_keeps_cycle_conf
 run_test test_bd_init_force_overwrites_cycle_conf
 run_test test_script_dir_parent_is_file
 run_test test_force_replaces_symlink
+run_test test_empty_branch_prefix_no_writes
 run_test test_reversed_drain_writeup_range_no_writes
 run_test test_same_file_script_copy
 
