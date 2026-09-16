@@ -35,6 +35,8 @@ eval "$funcs"
 declare -F feat_ref_matches_id >/dev/null || fail "feat_ref_matches_id not extracted"
 declare -F worktree_matches_id >/dev/null || fail "worktree_matches_id not extracted"
 declare -F write_beads_redirect >/dev/null || fail "write_beads_redirect not extracted"
+declare -F resolve_beads_redirect >/dev/null || fail "resolve_beads_redirect not extracted"
+declare -F ensure_beads_redirect_ignored >/dev/null || fail "ensure_beads_redirect_ignored not extracted"
 BRANCH_PREFIX=feat/
 
 TMP=$(mktemp -d "${TMPDIR:-/tmp}/bead-redirect-test.XXXXXX")
@@ -248,6 +250,62 @@ legacy_dot_abs=$(cd "$LEGACY_ROOT/.beads" && pwd -P)
 [[ "$got" == "$legacy_dot_abs" ]] || fail "host_beads_dir should prefer .beads: $got"
 REPO_ROOT=$saved_repo
 
+# Redirected host checkout: follow one hop to the actual store.
+REAL_STORE="$TMP/real-store"
+WRAP_HOST="$TMP/wrap-host"
+WRAP_FORK="$TMP/wrap-fork"
+mkdir -p "$REAL_STORE" "$WRAP_HOST/.beads" "$WRAP_FORK"
+printf 'real-db\n' >"$REAL_STORE/sentinel"
+real_abs=$(cd "$REAL_STORE" && pwd -P)
+printf '%s\n' "$real_abs" >"$WRAP_HOST/.beads/redirect"
+saved_repo=$REPO_ROOT
+REPO_ROOT=$WRAP_HOST
+unset BEADS_DIR
+unset BEAD_CYCLE_BEADS_DIR
+got=$(host_beads_dir) || fail "redirected host host_beads_dir failed"
+[[ "$got" == "$real_abs" ]] || fail "host_beads_dir did not follow redirect: $got (want $real_abs)"
+apply_host_beads_dir || fail "apply redirected host failed"
+[[ "$BEADS_DIR" == "$real_abs" ]] || fail "apply exported wrapper not store: $BEADS_DIR"
+out=$(write_beads_redirect "$WRAP_FORK" "$WRAP_HOST/.beads")
+[[ -n "$out" ]] || fail "wrap-fork write printed nothing"
+got=$(tr -d '\r\n' < "$WRAP_FORK/.beads/redirect")
+[[ "$got" == "$real_abs" ]] || fail "fork redirect chained to wrapper: $got (want $real_abs)"
+# Caller BEADS_DIR that is itself a redirect wrapper.
+BEADS_DIR="$WRAP_HOST/.beads"
+got=$(host_beads_dir) || fail "BEADS_DIR wrapper host_beads_dir failed"
+[[ "$got" == "$real_abs" ]] || fail "BEADS_DIR wrapper not followed: $got"
+unset BEADS_DIR
+unset BEAD_CYCLE_BEADS_DIR
+# Relative redirect is resolved from the parent of the beads dir.
+WRAP_REL="$TMP/wrap-rel"
+mkdir -p "$WRAP_REL/.beads"
+printf '../real-store\n' >"$WRAP_REL/.beads/redirect"
+REPO_ROOT=$WRAP_REL
+got=$(host_beads_dir) || fail "relative redirect host_beads_dir failed"
+[[ "$got" == "$real_abs" ]] || fail "relative redirect: $got (want $real_abs)"
+# One hop only (bd FollowRedirect does not chain).
+CHAIN_A="$TMP/chain-a"
+CHAIN_B="$TMP/chain-b"
+CHAIN_C="$TMP/chain-c"
+mkdir -p "$CHAIN_A/.beads" "$CHAIN_B/.beads" "$CHAIN_C"
+printf '%s\n' "$(cd "$CHAIN_B/.beads" && pwd -P)" >"$CHAIN_A/.beads/redirect"
+printf '%s\n' "$(cd "$CHAIN_C" && pwd -P)" >"$CHAIN_B/.beads/redirect"
+REPO_ROOT=$CHAIN_A
+got=$(host_beads_dir) || fail "chain host_beads_dir failed"
+chain_b_abs=$(cd "$CHAIN_B/.beads" && pwd -P)
+[[ "$got" == "$chain_b_abs" ]] || fail "should follow only one hop: $got (want $chain_b_abs)"
+# Broken redirect target keeps the wrapper.
+BROKEN="$TMP/broken-host"
+mkdir -p "$BROKEN/.beads"
+printf '/no/such/beads-store\n' >"$BROKEN/.beads/redirect"
+REPO_ROOT=$BROKEN
+got=$(host_beads_dir) || fail "broken redirect should keep wrapper"
+broken_abs=$(cd "$BROKEN/.beads" && pwd -P)
+[[ "$got" == "$broken_abs" ]] || fail "broken redirect dropped wrapper: $got"
+REPO_ROOT=$saved_repo
+unset BEADS_DIR
+unset BEAD_CYCLE_BEADS_DIR
+
 # CDPATH must not send a relative BEADS_DIR to a decoy store, and cd must
 # not print an extra path into $(canonical_dir) / host_beads_dir.
 CDPATH_WORK="$TMP/cdpath-work"
@@ -289,6 +347,40 @@ git -c init.defaultBranch=main init --quiet "$OTHER"
 if checkout_belongs_to_host "$OTHER"; then
   fail "foreign git checkout accepted"
 fi
+
+# Creating .beads/redirect in a dest with no .beads (legacy beads/ or
+# external BEADS_DIR) must add a git exclude so Grok cannot commit it.
+BARE_FORK="$TMP/bare-git-fork"
+mkdir -p "$BARE_FORK"
+git -c init.defaultBranch=main init --quiet "$BARE_FORK"
+[[ ! -e "$BARE_FORK/.beads" ]] || fail "bare fork already had .beads"
+out=$(write_beads_redirect "$BARE_FORK" "$HOST_BEADS")
+[[ -n "$out" ]] || fail "bare-fork write printed nothing"
+[[ -f "$BARE_FORK/.beads/redirect" ]] || fail "bare fork missing redirect"
+git -C "$BARE_FORK" check-ignore -q .beads/redirect \
+  || fail "created .beads/redirect is not gitignored"
+if git -C "$BARE_FORK" status --porcelain | grep -q '.beads'; then
+  fail "created .beads/redirect appeared in git status"
+fi
+exclude=$(git -C "$BARE_FORK" rev-parse --git-path info/exclude)
+case "$exclude" in
+  /*) ;;
+  *) exclude="$BARE_FORK/$exclude" ;;
+esac
+grep -qxF -- '.beads/redirect' "$exclude" || fail "exclude missing .beads/redirect"
+# No-op rewrite must restore exclude if it was removed.
+printf '# stripped\n' >"$exclude"
+out=$(write_beads_redirect "$BARE_FORK" "$HOST_BEADS")
+[[ -z "${out:-}" ]] || fail "noop exclude restore printed: $out"
+git -C "$BARE_FORK" check-ignore -q .beads/redirect \
+  || fail "noop write did not restore exclude"
+# Append after a file that lacks a trailing newline must not glue.
+printf '# no-nl' >"$exclude"
+out=$(write_beads_redirect "$BARE_FORK" "$HOST_BEADS")
+[[ -z "${out:-}" ]] || fail "no-nl exclude restore printed: $out"
+grep -qxF -- '.beads/redirect' "$exclude" || fail "glued exclude line: $(cat "$exclude")"
+git -C "$BARE_FORK" check-ignore -q .beads/redirect \
+  || fail "no-nl exclude did not ignore redirect"
 
 # OUT_FILE must be cleared before the cycle_cleanup EXIT trap.
 if ! awk '
