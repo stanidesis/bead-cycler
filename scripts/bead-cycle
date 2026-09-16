@@ -2,6 +2,9 @@
 # Host autopilot for one bead factory cycle in any Beads + GitHub repo.
 # Grok implements; this script nurses Copilot reviews in a bounded loop.
 # Re-running after a kill/crash resumes the same bead from git/GitHub/bd state.
+# Grok --worktree forks are standalone clones: this script writes
+# .beads/redirect (and exports BEADS_DIR) so bd in the fork uses the
+# host checkout's Dolt database, not an empty local copy.
 # Compatible with Bash 3.2 (stock macOS /usr/bin/env bash). No associative arrays.
 # Portable date: `date '+%Y-%m-%dT%H:%M:%S%z'` (stock macOS /bin/date has no GNU -Iseconds).
 # --drain <epic-id> walks remaining children, then closes the epic iff
@@ -16,6 +19,9 @@ DRAIN=0
 # Internal drain recovery log. Do not inherit from the environment: a
 # caller-set path would make --dry-run append (it must make no writes).
 DRAIN_LOG=""
+# Internal Grok output temp path. Do not inherit: cycle_cleanup rm -f's
+# it on EXIT, including dry-run and queue-empty before run_one_bead.
+OUT_FILE=""
 BEAD_ID=""
 SKIP_RUN=0
 # Set when BEAD_ID was an epic/milestone: ready/resume stay inside this parent.
@@ -82,7 +88,9 @@ epics are ignored. Default is one child per invocation.
      non-flat. The post-run summary ready count is informational and does
      not change the cycle exit code.
   2. Ask Grok to implement (or continue) it, open a PR, and request a
-     review from the configured reviewer
+     review from the configured reviewer. Grok --worktree forks get
+     .beads/redirect -> this checkout's .beads (plus BEADS_DIR) so
+     bd list/show/create use the host database, not an empty fork DB
   3. Poll the configured reviewer; if it leaves unresolved threads, ask
      Grok to fix and re-request. A "Needs a Closer Look" (or similar)
      overview with no unresolved threads still goes to Grok when that
@@ -119,6 +127,7 @@ Options:
   --review-timeout N   Seconds to wait for a Copilot review (default 600)
   --ci-timeout N       Seconds to wait for CI before merge (default 1200)
   --no-worktree        Run Grok in this checkout instead of a git worktree
+                       (skips .beads/redirect; still exports BEADS_DIR)
   --no-merge           Stop after Copilot is green; do not merge or close
   --dry-run            Print the selected bead and prompts; make no writes
   -h, --help           Show this help
@@ -1034,23 +1043,35 @@ discover_pr() {
   return 1
 }
 
-# Literal prefix match: quote the bead id so glob metacharacters (and '.' in
-# child ids like gitdown-kee.1) cannot overmatch feat/gitdown-keeX1-*.
+# Literal prefix match via substring, not [[ == ]] glob. BRANCH_PREFIX and
+# bead ids may contain metacharacters (topic?, gitdown-kee.1); an unquoted
+# * or ? on the right-hand side would overmatch.
 feat_ref_matches_id() {
   local short=$1
   local id=$2
-  [[ "$short" == "${BRANCH_PREFIX}${id}" || "$short" == "${BRANCH_PREFIX}${id}-"* ]]
+  local want="${BRANCH_PREFIX}${id}"
+  local wlen=${#want}
+  [[ "$short" == "$want" ]] && return 0
+  [[ ${#short} -gt $wlen && "${short:0:wlen}" == "$want" && "${short:wlen:1}" == "-" ]]
 }
 
 worktree_matches_id() {
   local path=$1
   local branch_short=$2
   local id=$3
-  local base
+  local base want wlen
   base=$(basename "$path")
-  [[ "$base" == "bead-${id}" || "$base" == "bead-${id}-"* || \
-     "$path" == *"/bead-${id}" || "$path" == *"/bead-${id}-"* ]] \
-    || feat_ref_matches_id "$branch_short" "$id"
+  # Literal dirname match via substring, not [[ == ]] glob. Same
+  # rationale as feat_ref_matches_id: ids may contain ? or *.
+  want="bead-${id}"
+  wlen=${#want}
+  if [[ "$base" == "$want" ]]; then
+    return 0
+  fi
+  if [[ ${#base} -gt $wlen && "${base:0:wlen}" == "$want" && "${base:wlen:1}" == "-" ]]; then
+    return 0
+  fi
+  feat_ref_matches_id "$branch_short" "$id"
 }
 
 matching_feat_branches() {
@@ -1104,6 +1125,266 @@ worktree_for_id() {
   done < <(git worktree list --porcelain; printf '\n')
   return 1
 }
+
+# --- beads redirect (begin)
+# dest_root: checkout to redirect. host_beads: host checkout's .beads dir.
+# Prints the redirect path when a file is written; prints nothing on skip.
+# Returns 0 on skip/success, 1 on write failure.
+canonical_dir() {
+  local dir=$1
+  [[ -n "$dir" && -d "$dir" ]] || return 1
+  (cd "$dir" && pwd -P)
+}
+
+write_beads_redirect() {
+  local dest=$1
+  local host_beads=$2
+  local dest_abs host_abs host_root beads redirect tmp cur=""
+  dest_abs=$(canonical_dir "$dest") || return 0
+  host_abs=$(canonical_dir "$host_beads") || return 1
+  # Compare dest to this checkout, not dirname(host_abs). A caller
+  # BEADS_DIR outside the repo must not create $REPO_ROOT/.beads/redirect
+  # pointing at that custom store (later runs without BEADS_DIR would
+  # follow it). dirname is only a fallback when REPO_ROOT is unset.
+  if [[ -n "${REPO_ROOT:-}" ]]; then
+    host_root=$(canonical_dir "$REPO_ROOT") || return 1
+  else
+    host_root=$(canonical_dir "$(dirname "$host_abs")") || return 1
+  fi
+  if [[ "$dest_abs" == "$host_root" ]]; then
+    return 0
+  fi
+  beads="$dest_abs/.beads"
+  # Never write through a symlink .beads: mv would follow it and could
+  # create host .beads/redirect (self-redirect) or mutate another store.
+  if [[ -L "$beads" ]]; then
+    return 0
+  fi
+  if [[ -d "$beads" ]]; then
+    cur=$(canonical_dir "$beads" || true)
+    if [[ -n "$cur" && "$cur" == "$host_abs" ]]; then
+      return 0
+    fi
+  fi
+  mkdir -p "$beads" || return 1
+  if [[ -L "$beads" ]]; then
+    return 1
+  fi
+  cur=$(canonical_dir "$beads" || true)
+  if [[ -n "$cur" && "$cur" == "$host_abs" ]]; then
+    return 0
+  fi
+  redirect="$beads/redirect"
+  if [[ -f "$redirect" && ! -L "$redirect" ]]; then
+    cur=$(tr -d '\r\n' < "$redirect" || true)
+    if [[ "$cur" == "$host_abs" ]]; then
+      return 0
+    fi
+  fi
+  # mv into a directory (or symlink-to-directory) nests the temp file
+  # and leaves .beads/redirect as a directory, so bd never sees a
+  # redirect file. Unlink a symlink without following it; replace a
+  # directory destination before the move.
+  if [[ -L "$redirect" ]]; then
+    rm -f "$redirect" || return 1
+  elif [[ -d "$redirect" ]]; then
+    rm -rf "$redirect" || return 1
+  elif [[ -e "$redirect" && ! -f "$redirect" ]]; then
+    rm -f "$redirect" || return 1
+  fi
+  tmp=$(mktemp "$beads/redirect.XXXXXX") || return 1
+  # Canonical absolute path. bd FollowRedirect accepts absolute or relative
+  # targets; relative ones have been resolved from either the worktree root
+  # or .beads/ depending on bd version (GH#1098, GH#1266, GH#1749).
+  if ! printf '%s\n' "$host_abs" >"$tmp"; then
+    rm -f "$tmp"
+    return 1
+  fi
+  if ! mv -f "$tmp" "$redirect"; then
+    rm -f "$tmp"
+    return 1
+  fi
+  printf '%s\n' "$redirect"
+}
+
+# Prefer a valid caller BEADS_DIR so claim/show and later heartbeat/close
+# stay on the same database. Fall back to this checkout's .beads, then
+# beads/ (legacy git-tracked layout).
+host_beads_dir() {
+  local dir=""
+  if [[ -n "${BEADS_DIR:-}" && -d "$BEADS_DIR" ]]; then
+    dir=$BEADS_DIR
+  elif [[ -n "${REPO_ROOT:-}" && -d "$REPO_ROOT/.beads" ]]; then
+    dir="$REPO_ROOT/.beads"
+  elif [[ -n "${REPO_ROOT:-}" && -d "$REPO_ROOT/beads" ]]; then
+    dir="$REPO_ROOT/beads"
+  else
+    return 1
+  fi
+  canonical_dir "$dir"
+}
+
+# Export the resolved store before any bd call. An inherited BEADS_DIR
+# that is not a directory must not stay in the environment: claim/show
+# would fail (or use the wrong DB) before configure_grok_cwd's fallback.
+# Returns 1 if BEADS_DIR is set but neither it nor $REPO_ROOT/.beads
+# (or $REPO_ROOT/beads) is a usable directory.
+apply_host_beads_dir() {
+  local host
+  if host=$(host_beads_dir); then
+    export BEADS_DIR="$host"
+    export BEAD_CYCLE_BEADS_DIR="$host"
+    return 0
+  fi
+  if [[ -n "${BEADS_DIR:-}" ]]; then
+    return 1
+  fi
+  return 0
+}
+
+# dest is this checkout, a grok fork of it, or a linked git worktree of it.
+checkout_belongs_to_host() {
+  local dest=$1
+  local dest_abs host_abs gitdir src dest_git host_git
+  [[ -n "${REPO_ROOT:-}" ]] || return 1
+  dest_abs=$(canonical_dir "$dest") || return 1
+  host_abs=$(canonical_dir "$REPO_ROOT") || return 1
+  if [[ "$dest_abs" == "$host_abs" ]]; then
+    return 0
+  fi
+  if [[ -d "$dest_abs/.git" && -f "$dest_abs/.git/grok-worktree-source" ]]; then
+    src=$(tr -d '\r\n' < "$dest_abs/.git/grok-worktree-source")
+    src=$(canonical_dir "$src" || true)
+    [[ -n "$src" && "$src" == "$host_abs" ]] && return 0
+    return 1
+  fi
+  gitdir=$(git -C "$dest_abs" rev-parse --git-dir 2>/dev/null) || return 1
+  case "$gitdir" in
+    /*) ;;
+    *) gitdir="$dest_abs/$gitdir" ;;
+  esac
+  if [[ -f "$gitdir/grok-worktree-source" ]]; then
+    src=$(tr -d '\r\n' < "$gitdir/grok-worktree-source")
+    src=$(canonical_dir "$src" || true)
+    [[ -n "$src" && "$src" == "$host_abs" ]] && return 0
+    return 1
+  fi
+  dest_git=$(git -C "$dest_abs" rev-parse --git-common-dir 2>/dev/null) || return 1
+  host_git=$(git -C "$host_abs" rev-parse --git-common-dir 2>/dev/null) || return 1
+  case "$dest_git" in
+    /*) ;;
+    *) dest_git="$dest_abs/$dest_git" ;;
+  esac
+  case "$host_git" in
+    /*) ;;
+    *) host_git="$host_abs/$host_git" ;;
+  esac
+  dest_git=$(canonical_dir "$dest_git" || true)
+  host_git=$(canonical_dir "$host_git" || true)
+  [[ -n "$dest_git" && -n "$host_git" && "$dest_git" == "$host_git" ]]
+}
+# --- beads redirect (end)
+
+# Unique existing checkouts for this bead (git worktrees + grok forks).
+bead_checkout_paths() {
+  local id=$1
+  local path="" branch="" short grok_home wt
+  {
+    [[ -n "${WORKTREE_PATH:-}" ]] && printf '%s\n' "$WORKTREE_PATH"
+    [[ -n "${GROK_CWD:-}" ]] && printf '%s\n' "$GROK_CWD"
+    while IFS= read -r line || [[ -n "$line" ]]; do
+      case "$line" in
+        worktree\ *)
+          path=${line#worktree }
+          ;;
+        branch\ *)
+          branch=${line#branch }
+          ;;
+        "")
+          if [[ -n "$path" ]]; then
+            short=${branch#refs/heads/}
+            if worktree_matches_id "$path" "$short" "$id"; then
+              printf '%s\n' "$path"
+            fi
+          fi
+          path=""
+          branch=""
+          ;;
+      esac
+    done < <(git worktree list --porcelain 2>/dev/null; printf '\n')
+    grok_home=${GROK_HOME:-$HOME/.grok}
+    # Do not interpolate $id into the pathname glob (? and * in an id
+    # would over-match). Filter with the literal matcher instead.
+    for wt in "$grok_home"/worktrees/*/bead-*; do
+      [[ -d "$wt" ]] || continue
+      worktree_matches_id "$wt" "" "$id" || continue
+      checkout_belongs_to_host "$wt" || continue
+      printf '%s\n' "$wt"
+    done
+  } | while IFS= read -r path; do
+    [[ -n "$path" && -d "$path" ]] || continue
+    checkout_belongs_to_host "$path" || continue
+    canonical_dir "$path" || true
+  done | awk 'NF && !seen[$0]++'
+}
+
+install_beads_redirects() {
+  local id=$1
+  local host dest wrote
+  host=$(host_beads_dir) || return 0
+  while IFS= read -r dest; do
+    [[ -n "$dest" ]] || continue
+    if wrote=$(write_beads_redirect "$dest" "$host"); then
+      if [[ -n "$wrote" ]]; then
+        log "beads redirect ${wrote} -> ${host}"
+      fi
+    else
+      log "warning: could not write .beads/redirect in ${dest}"
+    fi
+  done < <(bead_checkout_paths "$id")
+}
+
+REDIRECT_POLLER_PID=""
+
+start_beads_redirect_poller() {
+  local id=$1
+  [[ "$USE_WORKTREE" -eq 1 ]] || return 0
+  [[ "$DRY_RUN" -eq 0 ]] || return 0
+  [[ -n "$id" ]] || return 0
+  stop_beads_redirect_poller
+  (
+    trap 'exit 0' TERM INT HUP
+    set +e
+    while :; do
+      install_beads_redirects "$id"
+      sleep 1
+    done
+  ) &
+  REDIRECT_POLLER_PID=$!
+}
+
+stop_beads_redirect_poller() {
+  local pid=${REDIRECT_POLLER_PID:-}
+  REDIRECT_POLLER_PID=""
+  if [[ -n "$pid" ]]; then
+    kill "$pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || true
+  fi
+}
+
+cycle_cleanup() {
+  stop_beads_redirect_poller || true
+  if [[ -n "${OUT_FILE:-}" ]]; then
+    rm -f "$OUT_FILE" || true
+  fi
+}
+
+# Drop any inherited OUT_FILE before the EXIT trap: a caller path would
+# be deleted on dry-run / queue-empty, before run_one_bead creates one.
+OUT_FILE=""
+trap 'cycle_cleanup' EXIT
+trap 'cycle_cleanup; exit 130' INT
+trap 'cycle_cleanup; exit 143' TERM
 
 # Print every in-progress id (bd list -n 0 = unlimited; default is 50).
 # Fail the caller if both list forms fail or the payload is not a JSON array
@@ -1362,6 +1643,7 @@ Resume context (do not ignore; continue from here, do not start over):
 - existing open/merged/closed PR: ${PR_STATE}${PR_URL:+ ${PR_URL} (#${PR_NUMBER})}
 - existing feat branch: ${FEAT_BRANCH:-none}
 - existing grok worktree: ${WORKTREE_PATH:-none}
+- host beads: ${BEADS_DIR:-this checkout .beads} (forks use .beads/redirect + BEADS_DIR)
 
 If a ${BRANCH_PREFIX}${id}-* branch or grok worktree already exists, continue that work.
 Do not create a second ${BRANCH_PREFIX}${id}-* branch. Do not open a second PR.
@@ -1491,12 +1773,23 @@ run_grok() {
     args+=(--worktree="bead-${BEAD_ID}")
   fi
 
+  apply_host_beads_dir || true
+
+  if [[ "$USE_WORKTREE" -eq 1 ]]; then
+    install_beads_redirects "$BEAD_ID" || true
+    start_beads_redirect_poller "$BEAD_ID"
+  fi
+
   log "==> grok ${args[*]}"
   local ec=0
   set +e
   grok "${args[@]}" 2>&1 | tee -a "$LOG_FILE" | tee "$out_file"
   ec=${PIPESTATUS[0]}
   set -e
+  stop_beads_redirect_poller
+  if [[ "$USE_WORKTREE" -eq 1 ]]; then
+    install_beads_redirects "$BEAD_ID" || true
+  fi
   rm -f "$prompt_file"
   return "$ec"
 }
@@ -2017,10 +2310,14 @@ sync_git() {
 configure_grok_cwd() {
   GROK_CWD=$REPO_ROOT
   CREATE_WORKTREE=$USE_WORKTREE
+  apply_host_beads_dir || true
   if [[ -n "$WORKTREE_PATH" && -d "$WORKTREE_PATH" ]]; then
     GROK_CWD=$WORKTREE_PATH
     CREATE_WORKTREE=0
     log "reusing grok worktree ${WORKTREE_PATH}"
+  fi
+  if [[ "$USE_WORKTREE" -eq 1 && "$DRY_RUN" -eq 0 ]]; then
+    install_beads_redirects "$BEAD_ID" || true
   fi
 }
 
@@ -3316,6 +3613,7 @@ pr:          ${PR_STATE}${PR_URL:+ ${PR_URL} (#${PR_NUMBER})}
 branch:      ${FEAT_BRANCH:-none}
 worktree:    ${WORKTREE_PATH:-none}
 grok cwd:    ${GROK_CWD}
+beads dir:   ${BEADS_DIR:-none}
 new worktree:$([[ "$CREATE_WORKTREE" -eq 1 ]] && echo "bead-${BEAD_ID}" || echo no)
 max-turns:   ${MAX_TURNS}
 max-rounds:  ${MAX_ROUNDS}
@@ -3349,7 +3647,6 @@ EOF
     log "error: could not create temp file for Grok output"
     return 1
   fi
-  trap 'rm -f "$OUT_FILE"' EXIT
 
   if [[ "$STAGE" == "nurse" ]]; then
     log "open PR already exists (#${PR_NUMBER}); skipping implement"
@@ -3847,6 +4144,13 @@ drain_epic() {
 
 preflight
 load_repo_info
+
+# Resolve BEADS_DIR before resolve_scope_from_arg / select_and_claim_bead.
+# host_beads_dir's fallback is useless if an invalid inherited value is
+# still exported when those first bd calls run.
+if ! apply_host_beads_dir; then
+  die "BEADS_DIR is set but is not a usable directory (${BEADS_DIR})"
+fi
 
 if [[ "$DRY_RUN" -eq 0 ]]; then
   sync_git
