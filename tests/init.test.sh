@@ -292,6 +292,63 @@ test_newline_value_no_writes() {
   rm -rf "$tmp"
 }
 
+# mv into a directory named cycle.conf would "succeed" and leave CONF_PATH
+# as a directory. Reject that before any writes (same as SCRIPT_DEST).
+test_conf_path_is_directory() {
+  local tmp
+  tmp=$(mktemp -d)
+  make_repo "$tmp"
+  mkdir -p "$tmp/.beads/cycle.conf" "$tmp/scripts"
+  if bash "$INIT" --yes --force --dir "$tmp" >/dev/null 2>&1; then
+    rm -rf "$tmp"
+    printf 'expected directory cycle.conf to fail\n' >&2
+    return 1
+  fi
+  assert test -d "$tmp/.beads/cycle.conf"
+  assert test ! -e "$tmp/scripts/bead-cycle"
+  rm -rf "$tmp"
+}
+
+# Next: copy-paste lines must remain valid when --dir / --script-dir
+# contain whitespace (printf %q).
+test_next_step_quotes_paths() {
+  local tmp repo out
+  tmp=$(mktemp -d)
+  repo="$tmp/my cool app"
+  make_repo "$repo"
+  out=$(bash "$INIT" --yes --dir "$repo" --create-beads --script-dir "bin tools")
+  printf '%s\n' "$out" | grep -Fq "cd $(printf %q "$repo")"
+  printf '%s\n' "$out" | grep -Fq "$(printf %q "./bin tools/bead-cycle") --help"
+  assert test -x "$repo/bin tools/bead-cycle"
+  assert test -f "$repo/.beads/cycle.conf"
+  rm -rf "$tmp"
+}
+
+# --bd-init is a primary advertised mode. Stub bd so we cover command
+# selection, rediscovery of the dir bd created, and conf placement.
+test_bd_init_discovers_beads_dir() {
+  local tmp stub
+  tmp=$(mktemp -d)
+  stub=$(mktemp -d)
+  make_repo "$tmp"
+  cat >"$stub/bd" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\n' "$*" >"$PWD/.bd-stub-args"
+[[ $# -eq 2 && "$1" == init && "$2" == --non-interactive ]] || exit 1
+# Legacy layout so init must rediscover, not assume .beads/.
+mkdir -p "$PWD/beads"
+EOF
+  chmod +x "$stub/bd"
+  PATH="$stub:$PATH" bash "$INIT" --yes --dir "$tmp" --bd-init >/dev/null
+  grep -q '^init --non-interactive$' "$tmp/.bd-stub-args"
+  assert test -f "$tmp/beads/cycle.conf"
+  assert test ! -e "$tmp/.beads/cycle.conf"
+  assert_core_conf "$tmp/beads/cycle.conf"
+  assert test -x "$tmp/scripts/bead-cycle"
+  rm -rf "$tmp" "$stub"
+}
+
 # --force self-init copies scripts/bead-cycle onto itself; cp rejects that.
 # Point --script-dir at the source file so we hit the same-file path without
 # rewriting this checkout's cycle.conf.
@@ -328,6 +385,9 @@ run_test test_script_dir_flag
 run_test test_env_prefill_yes
 run_test test_unquotable_value_no_writes
 run_test test_newline_value_no_writes
+run_test test_conf_path_is_directory
+run_test test_next_step_quotes_paths
+run_test test_bd_init_discovers_beads_dir
 run_test test_same_file_script_copy
 
 printf '\n%s tests, %s failed\n' "$TESTS_RUN" "$TESTS_FAIL"
