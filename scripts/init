@@ -536,7 +536,8 @@ require_parent_dir() {
 decide_write() {
   local path=$1
   local var=$2
-  if [[ ! -e "$path" ]]; then
+  # Dangling symlinks fail -e; still count as existing so --yes keeps them.
+  if [[ ! -e "$path" && ! -L "$path" ]]; then
     printf -v "$var" '%s' 1
     return 0
   fi

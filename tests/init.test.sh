@@ -147,6 +147,36 @@ test_yes_keeps_existing_conf() {
   rm -rf "$tmp"
 }
 
+# --yes must keep a dangling cycle.conf / bead-cycle symlink; --force replaces.
+test_yes_keeps_dangling_symlinks() {
+  local tmp
+  tmp=$(mktemp -d)
+  make_repo "$tmp"
+  mkdir -p "$tmp/.beads" "$tmp/scripts"
+  ln -s "$tmp/.beads/missing.conf" "$tmp/.beads/cycle.conf"
+  ln -s "$tmp/scripts/missing" "$tmp/scripts/bead-cycle"
+  bash "$INIT" --yes --dir "$tmp" >/dev/null
+  assert test -L "$tmp/.beads/cycle.conf"
+  assert test -L "$tmp/scripts/bead-cycle"
+  rm -rf "$tmp"
+}
+
+test_force_replaces_dangling_symlinks() {
+  local tmp
+  tmp=$(mktemp -d)
+  make_repo "$tmp"
+  mkdir -p "$tmp/.beads" "$tmp/scripts"
+  ln -s "$tmp/.beads/missing.conf" "$tmp/.beads/cycle.conf"
+  ln -s "$tmp/scripts/missing" "$tmp/scripts/bead-cycle"
+  bash "$INIT" --yes --force --dir "$tmp" >/dev/null
+  assert test ! -L "$tmp/.beads/cycle.conf"
+  assert test -f "$tmp/.beads/cycle.conf"
+  assert_core_conf "$tmp/.beads/cycle.conf"
+  assert test ! -L "$tmp/scripts/bead-cycle"
+  assert test -x "$tmp/scripts/bead-cycle"
+  rm -rf "$tmp"
+}
+
 test_force_overwrites_conf() {
   local tmp
   tmp=$(mktemp -d)
@@ -489,6 +519,8 @@ run_test test_create_beads_and_bd_init_exclusive
 run_test test_yes_with_scripts_dir
 run_test test_yes_creates_scripts_dir
 run_test test_yes_keeps_existing_conf
+run_test test_yes_keeps_dangling_symlinks
+run_test test_force_replaces_dangling_symlinks
 run_test test_force_overwrites_conf
 run_test test_missing_beads_without_flags
 run_test test_refuses_cycler_root
