@@ -115,6 +115,20 @@ var_value() {
   eval "printf '%s' \"\${$1-}\""
 }
 
+# Inspect the live env var. $(...) strips trailing newlines, so a value
+# of $'5\n' would otherwise look like 5 before require_quotable runs.
+assert_env_no_newline() {
+  local key=$1
+  local val
+  is_var_set "$key" || return 0
+  eval "val=\${$key}"
+  case "$val" in
+    *$'\n'*|*$'\r'*)
+      die "${key} cannot contain a newline"
+      ;;
+  esac
+}
+
 decimal_int() {
   local n=$1
   [[ "$n" =~ ^[0-9]+$ ]] || return 1
@@ -302,6 +316,7 @@ prompt_core_key() {
   local fallback=$2
   local hint=$3
   local def
+  assert_env_no_newline "$key"
   def=$(effective_default "$key" "$fallback")
   if [[ "$YES" -eq 1 ]]; then
     printf '%s\n' "$def"
@@ -316,6 +331,7 @@ prompt_drain_key() {
   local fallback=$2
   local hint=$3
   local def
+  assert_env_no_newline "$key"
   def=$(effective_default "$key" "$fallback")
   if [[ "$YES" -eq 1 ]]; then
     printf '%s\n' "$def"
