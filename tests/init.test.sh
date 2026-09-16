@@ -122,6 +122,7 @@ test_yes_with_scripts_dir() {
   assert_core_conf "$tmp/.beads/cycle.conf"
   assert test -x "$tmp/scripts/bead-cycle"
   assert test ! -L "$tmp/scripts/bead-cycle"
+  [[ "$(stat -c '%a' "$tmp/scripts/bead-cycle")" == 755 ]]
   cmp -s "$ROOT/scripts/bead-cycle" "$tmp/scripts/bead-cycle"
   rm -rf "$tmp"
 }

@@ -888,7 +888,11 @@ copy_script() {
     rm -f "$tmp"
     die "could not copy bead-cycle to $SCRIPT_DEST"
   fi
-  chmod +x "$tmp"
+  # mktemp is 0600; chmod +x would yield 0711, unreadable to other users.
+  if ! chmod 0755 "$tmp"; then
+    rm -f "$tmp"
+    die "could not copy bead-cycle to $SCRIPT_DEST"
+  fi
   # cp follows dest symlinks; mv replaces the symlink itself.
   if ! mv "$tmp" "$SCRIPT_DEST"; then
     rm -f "$tmp"
