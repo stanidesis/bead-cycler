@@ -117,3 +117,14 @@ Grok prompts are self-contained (one claimed bead, branch prefix, configured rev
 ## Crash resume
 
 Re-running after Ctrl-C, a failed Grok session, or a killed host continues the same bead: in-progress issues, `<prefix><id>-*` branches/worktrees, and open PRs are reused. Implement is skipped when a PR is already open. A merged PR with a still-open bead is closed without another Grok session.
+
+## Grok worktrees and the beads database
+
+`grok --worktree` forks are standalone clones, so `bd` in the fork would otherwise open an empty local Dolt database. bead-cycle writes `.beads/redirect` in each matching fork (a canonical absolute path to this checkout's `.beads`, or `beads/` if that layout is used, or `BEADS_DIR` if set) and exports `BEADS_DIR` so `bd list` / `show` / `create` use the host tracker. `--no-worktree` skips the redirect file and still exports `BEADS_DIR`.
+
+## Tests
+
+```bash
+bash tests/init.test.sh
+bash tests/bead-cycle-redirect.test.sh
+```
