@@ -1138,12 +1138,69 @@ canonical_dir() {
   (unset CDPATH; cd "$dir" && pwd -P)
 }
 
+# If dir is a Beads redirect wrapper, print the one-hop target (canonical).
+# bd FollowRedirect follows only one level, so fork redirects must point at
+# the actual store, not at another redirect. Relative targets are resolved
+# from the parent of dir, matching FollowRedirect (GH#1098, GH#1266, GH#1749).
+resolve_beads_redirect() {
+  local dir=$1
+  local redirect target parent resolved
+  dir=$(canonical_dir "$dir") || return 1
+  redirect="$dir/redirect"
+  if [[ -f "$redirect" && ! -L "$redirect" ]]; then
+    target=$(tr -d '\r\n' < "$redirect" || true)
+    if [[ -n "$target" ]]; then
+      if [[ "$target" != /* ]]; then
+        parent=$(canonical_dir "$(dirname "$dir")") || parent=""
+        if [[ -z "$parent" ]]; then
+          printf '%s\n' "$dir"
+          return 0
+        fi
+        target="$parent/$target"
+      fi
+      if resolved=$(canonical_dir "$target"); then
+        printf '%s\n' "$resolved"
+        return 0
+      fi
+    fi
+  fi
+  printf '%s\n' "$dir"
+}
+
+# Ignore dest/.beads/redirect in that clone's exclude file so Grok cannot
+# git-add the machine-local path. Prefer info/exclude over writing a
+# tracked .beads/.gitignore (Beads doctor flags committed redirects).
+ensure_beads_redirect_ignored() {
+  local dest=$1
+  local exclude last
+  [[ -n "$dest" && -d "$dest" ]] || return 0
+  exclude=$(git -C "$dest" rev-parse --git-path info/exclude 2>/dev/null) || return 0
+  case "$exclude" in
+    /*) ;;
+    *) exclude="$dest/$exclude" ;;
+  esac
+  mkdir -p "$(dirname "$exclude")" || return 1
+  if [[ -f "$exclude" ]] && grep -qxF -- '.beads/redirect' "$exclude"; then
+    return 0
+  fi
+  # $(tail -c 1) strips a trailing newline, so a non-empty last char
+  # means the file does not end with LF and the next append would glue.
+  if [[ -f "$exclude" && -s "$exclude" ]]; then
+    last=$(tail -c 1 "$exclude" 2>/dev/null || true)
+    if [[ -n "$last" ]]; then
+      printf '\n' >>"$exclude" || return 1
+    fi
+  fi
+  printf '%s\n' '.beads/redirect' >>"$exclude"
+}
+
 write_beads_redirect() {
   local dest=$1
   local host_beads=$2
   local dest_abs host_abs host_root beads redirect tmp cur=""
   dest_abs=$(canonical_dir "$dest") || return 0
   host_abs=$(canonical_dir "$host_beads") || return 1
+  host_abs=$(resolve_beads_redirect "$host_abs") || return 1
   # Compare dest to this checkout, not dirname(host_abs). A caller
   # BEADS_DIR outside the repo must not create $REPO_ROOT/.beads/redirect
   # pointing at that custom store (later runs without BEADS_DIR would
@@ -1180,6 +1237,7 @@ write_beads_redirect() {
   if [[ -f "$redirect" && ! -L "$redirect" ]]; then
     cur=$(tr -d '\r\n' < "$redirect" || true)
     if [[ "$cur" == "$host_abs" ]]; then
+      ensure_beads_redirect_ignored "$dest_abs" || return 1
       return 0
     fi
   fi
@@ -1206,12 +1264,14 @@ write_beads_redirect() {
     rm -f "$tmp"
     return 1
   fi
+  ensure_beads_redirect_ignored "$dest_abs" || return 1
   printf '%s\n' "$redirect"
 }
 
 # Prefer a valid caller BEADS_DIR so claim/show and later heartbeat/close
 # stay on the same database. Fall back to this checkout's .beads, then
-# beads/ (legacy git-tracked layout).
+# beads/ (legacy git-tracked layout). Follow one existing redirect so a
+# host that is itself a Beads worktree exports/writes the actual store.
 host_beads_dir() {
   local dir=""
   if [[ -n "${BEADS_DIR:-}" && -d "$BEADS_DIR" ]]; then
@@ -1223,7 +1283,8 @@ host_beads_dir() {
   else
     return 1
   fi
-  canonical_dir "$dir"
+  dir=$(canonical_dir "$dir") || return 1
+  resolve_beads_redirect "$dir"
 }
 
 # Export the resolved store before any bd call. An inherited BEADS_DIR
