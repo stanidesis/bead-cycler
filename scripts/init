@@ -497,6 +497,28 @@ choose_script_dest() {
   SCRIPT_DEST=$(normalize_script_dest "$spec")
 }
 
+# Nearest existing ancestor must be a directory. mkdir -p cannot create
+# $ROOT/bin/bead-cycle when $ROOT/bin is a regular file.
+require_parent_dir() {
+  local path=$1
+  local label=$2
+  local cur parent
+  cur=$(dirname "$path")
+  while :; do
+    if [[ -L "$cur" || -e "$cur" ]]; then
+      if [[ -d "$cur" ]]; then
+        return 0
+      fi
+      die "${label} parent is not a directory: $cur"
+    fi
+    parent=$(dirname "$cur")
+    if [[ "$parent" == "$cur" ]]; then
+      die "${label} has no existing parent: $path"
+    fi
+    cur=$parent
+  done
+}
+
 decide_write() {
   local path=$1
   local var=$2
@@ -534,6 +556,12 @@ if [[ -d "$CONF_PATH" ]]; then
 fi
 if [[ -d "$SCRIPT_DEST" ]]; then
   die "script destination is a directory: $SCRIPT_DEST"
+fi
+if [[ "$WRITE_CONF" -eq 1 ]]; then
+  require_parent_dir "$CONF_PATH" "config path"
+fi
+if [[ "$WRITE_SCRIPT" -eq 1 ]]; then
+  require_parent_dir "$SCRIPT_DEST" "script destination"
 fi
 
 collect_config() {
@@ -819,22 +847,30 @@ write_conf_file() {
 }
 
 copy_script() {
-  local dest_dir
+  local dest_dir tmp
   dest_dir=$(dirname "$SCRIPT_DEST")
   if [[ "$DRY_RUN" -eq 1 ]]; then
     log "would copy $SOURCE_CYCLE -> $SCRIPT_DEST"
     return 0
   fi
-  # cp refuses a same-file copy (self-init --force, or --script-dir pointing here).
-  if [[ -e "$SCRIPT_DEST" && "$SOURCE_CYCLE" -ef "$SCRIPT_DEST" ]]; then
+  # Same-file copy (self-init --force). A dest symlink to this source is
+  # not "already installed": replace the symlink with a real file.
+  if [[ -e "$SCRIPT_DEST" && ! -L "$SCRIPT_DEST" && "$SOURCE_CYCLE" -ef "$SCRIPT_DEST" ]]; then
     log "bead-cycle already installed at $SCRIPT_DEST"
     return 0
   fi
   mkdir -p "$dest_dir"
-  if ! cp "$SOURCE_CYCLE" "$SCRIPT_DEST"; then
+  tmp=$(mktemp "$dest_dir/bead-cycle.XXXXXX")
+  if ! cp "$SOURCE_CYCLE" "$tmp"; then
+    rm -f "$tmp"
     die "could not copy bead-cycle to $SCRIPT_DEST"
   fi
-  chmod +x "$SCRIPT_DEST"
+  chmod +x "$tmp"
+  # cp follows dest symlinks; mv replaces the symlink itself.
+  if ! mv "$tmp" "$SCRIPT_DEST"; then
+    rm -f "$tmp"
+    die "could not copy bead-cycle to $SCRIPT_DEST"
+  fi
   log "copied $SCRIPT_DEST"
 }
 
