@@ -204,9 +204,13 @@ realpath_dir() {
 
 # Quote a cycle.conf value when it would break KEY=VALUE parsing.
 # Return 1 instead of die: $(conf_quote) cannot abort init.
+# Line breaks are never quotable: bead-cycle loads KEY=VALUE one line at a time.
 conf_quote() {
   local val=$1
   case "$val" in
+    *$'\n'*|*$'\r'*)
+      return 1
+      ;;
     *[[:space:]]*|*'#'*|*"'"*)
       if [[ "$val" == *"\""* ]]; then
         return 1
@@ -223,6 +227,11 @@ require_quotable() {
   local key=$1
   local val=$2
   [[ -n "$val" ]] || return 0
+  case "$val" in
+    *$'\n'*|*$'\r'*)
+      die "${key} cannot contain a newline"
+      ;;
+  esac
   if ! conf_quote "$val" >/dev/null; then
     die "${key} cannot contain both quotes and special characters"
   fi
@@ -808,6 +817,11 @@ copy_script() {
   dest_dir=$(dirname "$SCRIPT_DEST")
   if [[ "$DRY_RUN" -eq 1 ]]; then
     log "would copy $SOURCE_CYCLE -> $SCRIPT_DEST"
+    return 0
+  fi
+  # cp refuses a same-file copy (self-init --force, or --script-dir pointing here).
+  if [[ -e "$SCRIPT_DEST" && "$SOURCE_CYCLE" -ef "$SCRIPT_DEST" ]]; then
+    log "bead-cycle already installed at $SCRIPT_DEST"
     return 0
   fi
   mkdir -p "$dest_dir"
