@@ -519,6 +519,22 @@ test_force_replaces_symlink() {
   rm -f "$ext"
 }
 
+# Reversed write-up bounds match no epic in bead-cycle. Reject before writes.
+test_reversed_drain_writeup_range_no_writes() {
+  local tmp
+  tmp=$(mktemp -d)
+  make_repo "$tmp"
+  if BEAD_CYCLE_DRAIN_WRITEUP_N_MIN=10 BEAD_CYCLE_DRAIN_WRITEUP_N_MAX=1 \
+    bash "$INIT" --yes --dir "$tmp" --create-beads >/dev/null 2>&1; then
+    rm -rf "$tmp"
+    printf 'expected reversed drain write-up range to fail\n' >&2
+    return 1
+  fi
+  assert test ! -e "$tmp/.beads"
+  assert test ! -e "$tmp/scripts"
+  rm -rf "$tmp"
+}
+
 # --force self-init copies scripts/bead-cycle onto itself; cp rejects that.
 # Point --script-dir at the source file so we hit the same-file path without
 # rewriting this checkout's cycle.conf.
@@ -567,6 +583,7 @@ run_test test_bd_init_yes_keeps_cycle_conf
 run_test test_bd_init_force_overwrites_cycle_conf
 run_test test_script_dir_parent_is_file
 run_test test_force_replaces_symlink
+run_test test_reversed_drain_writeup_range_no_writes
 run_test test_same_file_script_copy
 
 printf '\n%s tests, %s failed\n' "$TESTS_RUN" "$TESTS_FAIL"

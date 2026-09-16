@@ -731,6 +731,11 @@ validate_config() {
       || die "BEAD_CYCLE_DRAIN_WRITEUP_N_MAX must be an integer"
     CONF_DRAIN_WRITEUP_N_MAX=$n
   fi
+  # Inclusive range; min > max matches no epic and blocks --drain forever.
+  if [[ -n "$CONF_DRAIN_WRITEUP_N_MIN" && -n "$CONF_DRAIN_WRITEUP_N_MAX" ]]; then
+    (( CONF_DRAIN_WRITEUP_N_MIN <= CONF_DRAIN_WRITEUP_N_MAX )) \
+      || die "BEAD_CYCLE_DRAIN_WRITEUP_N_MIN must be <= BEAD_CYCLE_DRAIN_WRITEUP_N_MAX"
+  fi
 
   require_quotable BEAD_CYCLE_REVIEWER "$CONF_REVIEWER"
   require_quotable BEAD_CYCLE_BRANCH_PREFIX "$CONF_BRANCH_PREFIX"
