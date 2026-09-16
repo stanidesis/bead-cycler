@@ -278,6 +278,38 @@ test_unquotable_value_no_writes() {
   rm -rf "$tmp"
 }
 
+test_newline_value_no_writes() {
+  local tmp
+  tmp=$(mktemp -d)
+  make_repo "$tmp"
+  if BEAD_CYCLE_REVIEWER=$'copilot\nbot' bash "$INIT" --yes --dir "$tmp" --create-beads >/dev/null 2>&1; then
+    rm -rf "$tmp"
+    printf 'expected newline REVIEWER to fail\n' >&2
+    return 1
+  fi
+  assert test ! -e "$tmp/.beads"
+  assert test ! -e "$tmp/scripts"
+  rm -rf "$tmp"
+}
+
+# --force self-init copies scripts/bead-cycle onto itself; cp rejects that.
+# Point --script-dir at the source file so we hit the same-file path without
+# rewriting this checkout's cycle.conf.
+test_same_file_script_copy() {
+  local tmp before after err
+  tmp=$(mktemp -d)
+  make_repo "$tmp"
+  mkdir -p "$tmp/.beads"
+  before=$(cksum "$ROOT/scripts/bead-cycle")
+  err=$(bash "$INIT" --yes --force --dir "$tmp" --script-dir "$ROOT/scripts/bead-cycle" 2>&1)
+  after=$(cksum "$ROOT/scripts/bead-cycle")
+  [[ "$before" == "$after" ]]
+  printf '%s\n' "$err" | grep -q 'bead-cycle already installed'
+  assert test -f "$tmp/.beads/cycle.conf"
+  assert_core_conf "$tmp/.beads/cycle.conf"
+  rm -rf "$tmp"
+}
+
 run_test test_help
 run_test test_unknown_flag
 run_test test_create_beads_and_bd_init_exclusive
@@ -295,6 +327,8 @@ run_test test_legacy_beads_dir
 run_test test_script_dir_flag
 run_test test_env_prefill_yes
 run_test test_unquotable_value_no_writes
+run_test test_newline_value_no_writes
+run_test test_same_file_script_copy
 
 printf '\n%s tests, %s failed\n' "$TESTS_RUN" "$TESTS_FAIL"
 [[ "$TESTS_FAIL" -eq 0 ]]
