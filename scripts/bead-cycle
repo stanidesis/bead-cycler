@@ -1133,7 +1133,9 @@ worktree_for_id() {
 canonical_dir() {
   local dir=$1
   [[ -n "$dir" && -d "$dir" ]] || return 1
-  (cd "$dir" && pwd -P)
+  # Relative BEADS_DIR (and other caller paths) must not follow CDPATH,
+  # and cd must not print the selected directory into $(canonical_dir).
+  (unset CDPATH; cd "$dir" && pwd -P)
 }
 
 write_beads_redirect() {
