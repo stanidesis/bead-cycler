@@ -685,8 +685,11 @@ validate_config() {
   CONF_REVIEWER=$(trim_ws "$CONF_REVIEWER")
   CONF_BRANCH_PREFIX=$(trim_ws "$CONF_BRANCH_PREFIX")
   [[ -n "$CONF_REVIEWER" ]] || die "BEAD_CYCLE_REVIEWER must not be empty"
+  # bead-cycle uses ${BEAD_CYCLE_BRANCH_PREFIX:-feat/}; an empty write
+  # would be ignored and silently become feat/ at runtime.
+  [[ -n "$CONF_BRANCH_PREFIX" ]] || die "BEAD_CYCLE_BRANCH_PREFIX must not be empty"
 
-  if [[ -n "$CONF_BRANCH_PREFIX" && "$CONF_BRANCH_PREFIX" != */ ]]; then
+  if [[ "$CONF_BRANCH_PREFIX" != */ ]]; then
     CONF_BRANCH_PREFIX="${CONF_BRANCH_PREFIX}/"
   fi
 
