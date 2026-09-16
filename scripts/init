@@ -817,6 +817,14 @@ ensure_beads_dir() {
         BEADS_DIR="$ROOT/beads"
       fi
       CONF_PATH="$BEADS_DIR/cycle.conf"
+      if [[ -d "$CONF_PATH" ]]; then
+        die "config path is a directory: $CONF_PATH"
+      fi
+      # bd init may have created cycle.conf after the original decide_write.
+      decide_write "$CONF_PATH" WRITE_CONF
+      if [[ "$WRITE_CONF" -eq 1 ]]; then
+        require_parent_dir "$CONF_PATH" "config path"
+      fi
       ;;
     *)
       die "internal error: unknown beads action: $BEADS_ACTION"
@@ -875,8 +883,11 @@ copy_script() {
 }
 
 # Beads dir first so a failed bd init does not leave a copied script behind.
+# Re-check WRITE_CONF after bd init: that command can create cycle.conf.
 if [[ "$WRITE_CONF" -eq 1 ]]; then
   ensure_beads_dir
+fi
+if [[ "$WRITE_CONF" -eq 1 ]]; then
   write_conf_file
 fi
 

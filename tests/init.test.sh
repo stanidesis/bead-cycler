@@ -349,6 +349,48 @@ EOF
   rm -rf "$tmp" "$stub"
 }
 
+# --yes keeps a cycle.conf that bd init created (legacy beads/ path).
+test_bd_init_yes_keeps_cycle_conf() {
+  local tmp stub err
+  tmp=$(mktemp -d)
+  stub=$(mktemp -d)
+  make_repo "$tmp"
+  cat >"$stub/bd" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+[[ $# -eq 2 && "$1" == init && "$2" == --non-interactive ]] || exit 1
+mkdir -p "$PWD/beads"
+printf 'BEAD_CYCLE_REVIEWER=from-bd\n' >"$PWD/beads/cycle.conf"
+EOF
+  chmod +x "$stub/bd"
+  err=$(PATH="$stub:$PATH" bash "$INIT" --yes --dir "$tmp" --bd-init 2>&1)
+  printf '%s\n' "$err" | grep -q 'keeping existing'
+  grep -q '^BEAD_CYCLE_REVIEWER=from-bd$' "$tmp/beads/cycle.conf"
+  assert test ! -e "$tmp/.beads/cycle.conf"
+  assert test -x "$tmp/scripts/bead-cycle"
+  rm -rf "$tmp" "$stub"
+}
+
+# --force still replaces the file bd init wrote.
+test_bd_init_force_overwrites_cycle_conf() {
+  local tmp stub
+  tmp=$(mktemp -d)
+  stub=$(mktemp -d)
+  make_repo "$tmp"
+  cat >"$stub/bd" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+[[ $# -eq 2 && "$1" == init && "$2" == --non-interactive ]] || exit 1
+mkdir -p "$PWD/beads"
+printf 'BEAD_CYCLE_REVIEWER=from-bd\n' >"$PWD/beads/cycle.conf"
+EOF
+  chmod +x "$stub/bd"
+  PATH="$stub:$PATH" bash "$INIT" --yes --force --dir "$tmp" --bd-init >/dev/null
+  grep -q '^BEAD_CYCLE_REVIEWER=copilot-pull-request-reviewer\[bot\]$' "$tmp/beads/cycle.conf"
+  assert test -x "$tmp/scripts/bead-cycle"
+  rm -rf "$tmp" "$stub"
+}
+
 # --script-dir bin when bin is a regular file: mkdir -p fails after conf
 # would already have been written. Reject the ancestor before any writes.
 test_script_dir_parent_is_file() {
@@ -425,6 +467,8 @@ run_test test_newline_value_no_writes
 run_test test_conf_path_is_directory
 run_test test_next_step_quotes_paths
 run_test test_bd_init_discovers_beads_dir
+run_test test_bd_init_yes_keeps_cycle_conf
+run_test test_bd_init_force_overwrites_cycle_conf
 run_test test_script_dir_parent_is_file
 run_test test_force_replaces_symlink
 run_test test_same_file_script_copy
