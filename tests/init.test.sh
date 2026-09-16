@@ -64,6 +64,14 @@ assert() {
   fi
 }
 
+# GNU stat -c / BSD stat -f. Avoid GNU-only flags so the suite runs on macOS.
+file_mode() {
+  local m
+  m=$(stat -c '%a' "$1" 2>/dev/null) && { printf '%s\n' "$m"; return 0; }
+  m=$(stat -f '%OLp' "$1" 2>/dev/null) && { printf '%s\n' "$m"; return 0; }
+  return 1
+}
+
 make_repo() {
   local d=$1
   mkdir -p "$d"
@@ -122,7 +130,7 @@ test_yes_with_scripts_dir() {
   assert_core_conf "$tmp/.beads/cycle.conf"
   assert test -x "$tmp/scripts/bead-cycle"
   assert test ! -L "$tmp/scripts/bead-cycle"
-  [[ "$(stat -c '%a' "$tmp/scripts/bead-cycle")" == 755 ]]
+  [[ "$(file_mode "$tmp/scripts/bead-cycle")" == 755 ]]
   cmp -s "$ROOT/scripts/bead-cycle" "$tmp/scripts/bead-cycle"
   rm -rf "$tmp"
 }
@@ -346,6 +354,21 @@ test_unquotable_value_no_writes() {
   rm -rf "$tmp"
 }
 
+# $(prompt_core_key) strips a trailing newline; reject the env var first.
+test_trailing_newline_env_no_writes() {
+  local tmp
+  tmp=$(mktemp -d)
+  make_repo "$tmp"
+  if BEAD_CYCLE_MAX_ROUNDS=$'5\n' bash "$INIT" --yes --dir "$tmp" --create-beads >/dev/null 2>&1; then
+    rm -rf "$tmp"
+    printf 'expected trailing newline MAX_ROUNDS to fail\n' >&2
+    return 1
+  fi
+  assert test ! -e "$tmp/.beads"
+  assert test ! -e "$tmp/scripts"
+  rm -rf "$tmp"
+}
+
 test_newline_value_no_writes() {
   local tmp
   tmp=$(mktemp -d)
@@ -535,6 +558,7 @@ run_test test_env_prefill_yes
 run_test test_cdpath_does_not_redirect_dir
 run_test test_double_quoted_value_round_trips
 run_test test_unquotable_value_no_writes
+run_test test_trailing_newline_env_no_writes
 run_test test_newline_value_no_writes
 run_test test_conf_path_is_directory
 run_test test_next_step_quotes_paths
