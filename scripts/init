@@ -2,6 +2,9 @@
 # Bootstrap bead-cycle + cycle.conf into a target git repo.
 # Compatible with Bash 3.2 (stock macOS /usr/bin/env bash).
 set -euo pipefail
+# Relative cd (including --dir) must not follow an exported CDPATH, and
+# CDPATH must not print a path into $(cd ...) substitutions.
+unset CDPATH
 
 YES=0
 FORCE=0
@@ -205,12 +208,23 @@ realpath_dir() {
 # Quote a cycle.conf value when it would break KEY=VALUE parsing.
 # Return 1 instead of die: $(conf_quote) cannot abort init.
 # Line breaks are never quotable: bead-cycle loads KEY=VALUE one line at a time.
+# Values that already start and end with " must be wrapped in single quotes;
+# bead-cycle strips matching outer quotes, so a raw "quoted" reloads as quoted.
 conf_quote() {
   local val=$1
   case "$val" in
     *$'\n'*|*$'\r'*)
       return 1
       ;;
+  esac
+  if [[ "$val" == \"*\" ]]; then
+    if [[ "$val" == *"'"* ]]; then
+      return 1
+    fi
+    printf "'%s'" "$val"
+    return 0
+  fi
+  case "$val" in
     *[[:space:]]*|*'#'*|*"'"*)
       if [[ "$val" == *"\""* ]]; then
         return 1

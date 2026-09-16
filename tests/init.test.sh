@@ -264,6 +264,43 @@ test_env_prefill_yes() {
   rm -rf "$tmp"
 }
 
+# CDPATH can make `cd app` land in another tree and pollute $(cd ...).
+test_cdpath_does_not_redirect_dir() {
+  local tmp decoy workspace
+  tmp=$(mktemp -d)
+  decoy="$tmp/decoy"
+  workspace="$tmp/workspace"
+  mkdir -p "$decoy/app" "$workspace"
+  make_repo "$decoy/app"
+  make_repo "$workspace/app"
+  (
+    cd "$workspace"
+    CDPATH="$decoy" bash "$INIT" --yes --dir app --create-beads >/dev/null
+  )
+  assert test -f "$workspace/app/.beads/cycle.conf"
+  assert test ! -e "$decoy/app/.beads"
+  rm -rf "$tmp"
+}
+
+# bead-cycle strips matching outer quotes, so "quoted" must be wrapped.
+test_double_quoted_value_round_trips() {
+  local tmp line val
+  tmp=$(mktemp -d)
+  make_repo "$tmp"
+  BEAD_CYCLE_REVIEWER='"quoted"' bash "$INIT" --yes --dir "$tmp" --create-beads >/dev/null
+  line=$(grep '^BEAD_CYCLE_REVIEWER=' "$tmp/.beads/cycle.conf")
+  val=${line#BEAD_CYCLE_REVIEWER=}
+  if [[ "$val" == \"*\" ]]; then
+    val=${val#\"}
+    val=${val%\"}
+  elif [[ "$val" == \'*\' ]]; then
+    val=${val#\'}
+    val=${val%\'}
+  fi
+  [[ "$val" == '"quoted"' ]]
+  rm -rf "$tmp"
+}
+
 test_unquotable_value_no_writes() {
   local tmp
   tmp=$(mktemp -d)
@@ -462,6 +499,8 @@ run_test test_bad_merge_methods_env_no_writes
 run_test test_legacy_beads_dir
 run_test test_script_dir_flag
 run_test test_env_prefill_yes
+run_test test_cdpath_does_not_redirect_dir
+run_test test_double_quoted_value_round_trips
 run_test test_unquotable_value_no_writes
 run_test test_newline_value_no_writes
 run_test test_conf_path_is_directory
