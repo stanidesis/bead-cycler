@@ -349,6 +349,43 @@ EOF
   rm -rf "$tmp" "$stub"
 }
 
+# --script-dir bin when bin is a regular file: mkdir -p fails after conf
+# would already have been written. Reject the ancestor before any writes.
+test_script_dir_parent_is_file() {
+  local tmp
+  tmp=$(mktemp -d)
+  make_repo "$tmp"
+  printf 'not a dir\n' >"$tmp/bin"
+  if bash "$INIT" --yes --dir "$tmp" --create-beads --script-dir bin >/dev/null 2>&1; then
+    rm -rf "$tmp"
+    printf 'expected file parent to fail\n' >&2
+    return 1
+  fi
+  assert test ! -e "$tmp/.beads"
+  assert test ! -e "$tmp/scripts"
+  assert test -f "$tmp/bin"
+  rm -rf "$tmp"
+}
+
+# cp would follow dest and overwrite the external target; mv replaces
+# the symlink in the repo instead.
+test_force_replaces_symlink() {
+  local tmp ext
+  tmp=$(mktemp -d)
+  ext=$(mktemp)
+  printf 'external\n' >"$ext"
+  make_repo "$tmp"
+  mkdir -p "$tmp/scripts" "$tmp/.beads"
+  ln -s "$ext" "$tmp/scripts/bead-cycle"
+  bash "$INIT" --yes --force --dir "$tmp" >/dev/null
+  assert test ! -L "$tmp/scripts/bead-cycle"
+  assert test -x "$tmp/scripts/bead-cycle"
+  cmp -s "$ROOT/scripts/bead-cycle" "$tmp/scripts/bead-cycle"
+  grep -q '^external$' "$ext"
+  rm -rf "$tmp"
+  rm -f "$ext"
+}
+
 # --force self-init copies scripts/bead-cycle onto itself; cp rejects that.
 # Point --script-dir at the source file so we hit the same-file path without
 # rewriting this checkout's cycle.conf.
@@ -388,6 +425,8 @@ run_test test_newline_value_no_writes
 run_test test_conf_path_is_directory
 run_test test_next_step_quotes_paths
 run_test test_bd_init_discovers_beads_dir
+run_test test_script_dir_parent_is_file
+run_test test_force_replaces_symlink
 run_test test_same_file_script_copy
 
 printf '\n%s tests, %s failed\n' "$TESTS_RUN" "$TESTS_FAIL"
