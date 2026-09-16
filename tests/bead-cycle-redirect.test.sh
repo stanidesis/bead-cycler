@@ -248,6 +248,32 @@ legacy_dot_abs=$(cd "$LEGACY_ROOT/.beads" && pwd -P)
 [[ "$got" == "$legacy_dot_abs" ]] || fail "host_beads_dir should prefer .beads: $got"
 REPO_ROOT=$saved_repo
 
+# CDPATH must not send a relative BEADS_DIR to a decoy store, and cd must
+# not print an extra path into $(canonical_dir) / host_beads_dir.
+CDPATH_WORK="$TMP/cdpath-work"
+CDPATH_DECOY="$TMP/cdpath-decoy"
+mkdir -p "$CDPATH_WORK/beads" "$CDPATH_DECOY/beads"
+printf 'intended\n' >"$CDPATH_WORK/beads/sentinel"
+printf 'decoy\n' >"$CDPATH_DECOY/beads/sentinel"
+intended_beads=$(cd "$CDPATH_WORK/beads" && pwd -P)
+(
+  cd "$CDPATH_WORK"
+  export CDPATH="$CDPATH_DECOY"
+  got=$(canonical_dir beads) || exit 10
+  [[ "$got" == "$intended_beads" ]] || exit 11
+  BEADS_DIR=beads
+  unset REPO_ROOT
+  got=$(host_beads_dir) || exit 12
+  [[ "$got" == "$intended_beads" ]] || exit 13
+  apply_host_beads_dir || exit 14
+  [[ "$BEADS_DIR" == "$intended_beads" ]] || exit 15
+  [[ "$BEAD_CYCLE_BEADS_DIR" == "$intended_beads" ]] || exit 16
+)
+cdpath_st=$?
+if [[ $cdpath_st -ne 0 ]]; then
+  fail "CDPATH redirected canonical_dir/host_beads_dir (status $cdpath_st)"
+fi
+
 # checkout_belongs_to_host: same tree, grok source match/mismatch, foreign git.
 checkout_belongs_to_host "$HOST_ROOT" || fail "host should belong to host"
 mkdir -p "$FORK/.git"
