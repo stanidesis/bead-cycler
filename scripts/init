@@ -529,6 +529,9 @@ choose_script_dest
 decide_write "$CONF_PATH" WRITE_CONF
 decide_write "$SCRIPT_DEST" WRITE_SCRIPT
 
+if [[ -d "$CONF_PATH" ]]; then
+  die "config path is a directory: $CONF_PATH"
+fi
 if [[ -d "$SCRIPT_DEST" ]]; then
   die "script destination is a directory: $SCRIPT_DEST"
 fi
@@ -800,6 +803,9 @@ write_conf_file() {
     return 0
   fi
   mkdir -p "$BEADS_DIR"
+  if [[ -d "$CONF_PATH" ]]; then
+    die "config path is a directory: $CONF_PATH"
+  fi
   tmp=$(mktemp "$BEADS_DIR/cycle.conf.XXXXXX")
   if ! emit_cycle_conf >"$tmp"; then
     rm -f "$tmp"
@@ -868,5 +874,5 @@ fi
 printf '  %s\n' "$CONF_PATH"
 printf '  %s\n' "$SCRIPT_DEST"
 printf '\nNext:\n'
-printf '  cd %s\n' "$ROOT"
-printf '  %s --help\n' "$rel_script"
+printf '  cd %q\n' "$ROOT"
+printf '  %q --help\n' "$rel_script"
